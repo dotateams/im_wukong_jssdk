@@ -287,14 +287,72 @@ test("e2ee_chat_manager restores repeated history ciphertext from plaintext cach
     assert.equal((replay as any).e2eeDecryptFailed, false);
 });
 
-test("e2ee_chat_manager removes legacy localStorage plaintext cache", async () => {
-    const legacyStorage = installStorageMock("localStorage");
+test("e2ee_chat_manager restores self-sent ciphertext after session cache is cleared", async () => {
+    const localCache = installStorageMock("localStorage");
+    const sessionCache = installStorageMock("sessionStorage");
     const sdk = resetSdk();
-    legacyStorage.set("wk_e2ee_plaintext:sender:web-device-1:ct:legacy", JSON.stringify({
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const first = new Message();
+    first.messageID = "msg-self-1";
+    first.clientMsgNo = "client-self-1";
+    first.channel = channel;
+    first.fromUID = "sender";
+    first.content = signalContent("signal_group");
+
+    let decryptCalls = 0;
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                return new MessageText("self cached plaintext");
+            },
+        },
+    });
+
+    await sdk.chatManager.decryptMessageIfNeeded(first);
+    assert.equal(decryptCalls, 1);
+    assert.equal((first.content as MessageText).text, "self cached plaintext");
+    assert.ok([...localCache.keys()].some((key) => key.includes("wk_e2ee_plaintext:sender:web-device-1:ct:")));
+
+    sessionCache.clear();
+    (sdk.chatManager as any).e2eePlaintextMemoryCache.clear();
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                throw new Error("Missing message key");
+            },
+        },
+    });
+
+    const replay = new Message();
+    replay.messageID = "msg-self-1";
+    replay.clientMsgNo = "client-self-1";
+    replay.channel = channel;
+    replay.fromUID = "sender";
+    replay.content = signalContent("signal_group");
+
+    await sdk.chatManager.decryptMessageIfNeeded(replay);
+
+    assert.ok(replay.content instanceof MessageText);
+    assert.equal((replay.content as MessageText).text, "self cached plaintext");
+    assert.equal((replay as any).e2eeDecryptFailed, false);
+});
+
+test("e2ee_chat_manager replaces expired persistent plaintext cache entries", async () => {
+    const persistentStorage = installStorageMock("localStorage");
+    const sdk = resetSdk();
+    persistentStorage.set("wk_e2ee_plaintext:sender:web-device-1:cno:expired-client", JSON.stringify({
         type: MessageContentType.text,
         payload: { content: "legacy plaintext" },
+        expiresAt: Date.now() - 1,
     }));
     const message = new Message();
+    message.clientMsgNo = "expired-client";
     message.channel = new Channel("receiver", ChannelTypePerson);
     message.content = signalContent("signal_multi");
 
@@ -308,7 +366,9 @@ test("e2ee_chat_manager removes legacy localStorage plaintext cache", async () =
 
     await sdk.chatManager.decryptMessageIfNeeded(message);
 
-    assert.equal(legacyStorage.size, 0);
+    const refreshed = JSON.parse(persistentStorage.get("wk_e2ee_plaintext:sender:web-device-1:cno:expired-client") || "{}");
+    assert.equal(refreshed.payload.content, "fresh plaintext");
+    assert.ok(refreshed.expiresAt > Date.now());
     assert.equal((message.content as MessageText).text, "fresh plaintext");
 });
 

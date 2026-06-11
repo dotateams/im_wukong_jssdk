@@ -227,7 +227,6 @@ export class ChatManager {
     }
 
     cacheE2EEPlaintext(message: Message, signalContent: MessageContent | any, plaintextContent: MessageContent) {
-        this.clearLegacyE2EEPlaintextLocalStorage()
         if (!plaintextContent) {
             return
         }
@@ -247,6 +246,7 @@ export class ChatManager {
             for (const key of keys) {
                 this.e2eePlaintextMemoryCache.set(key, value)
                 this.getE2EEPlaintextSessionStorage()?.setItem(key, value)
+                this.getE2EEPlaintextLocalStorage()?.setItem(key, value)
             }
         } catch (error) {
             if (WKSDK.shared().config.debug) {
@@ -256,17 +256,15 @@ export class ChatManager {
     }
 
     restoreCachedE2EEPlaintext(message: Message, signalContent: MessageContent | any): MessageContent | undefined {
-        this.clearLegacyE2EEPlaintextLocalStorage()
         for (const key of this.e2eePlaintextCacheKeys(message, signalContent)) {
-            const cached = this.e2eePlaintextMemoryCache.get(key) || this.getE2EEPlaintextSessionStorage()?.getItem(key)
+            const cached = this.e2eePlaintextMemoryCache.get(key) || this.getE2EEPlaintextSessionStorage()?.getItem(key) || this.getE2EEPlaintextLocalStorage()?.getItem(key)
             if (!cached) {
                 continue
             }
             try {
                 const data = JSON.parse(cached)
                 if (data.expiresAt && Number(data.expiresAt) < Date.now()) {
-                    this.e2eePlaintextMemoryCache.delete(key)
-                    this.getE2EEPlaintextSessionStorage()?.removeItem(key)
+                    this.removeE2EEPlaintextCacheKey(key)
                     continue
                 }
                 const contentType = Number(data.type || signalContent.realContentType)
@@ -276,14 +274,19 @@ export class ChatManager {
                 content.decode(this.stringToUint8Array(JSON.stringify(payload)))
                 return content
             } catch (error) {
-                this.e2eePlaintextMemoryCache.delete(key)
-                this.getE2EEPlaintextSessionStorage()?.removeItem(key)
+                this.removeE2EEPlaintextCacheKey(key)
                 if (WKSDK.shared().config.debug) {
                     console.warn("[E2EE] plaintext cache read failed", error)
                 }
             }
         }
         return undefined
+    }
+
+    private removeE2EEPlaintextCacheKey(key: string) {
+        this.e2eePlaintextMemoryCache.delete(key)
+        this.getE2EEPlaintextSessionStorage()?.removeItem(key)
+        this.getE2EEPlaintextLocalStorage()?.removeItem(key)
     }
 
     e2eePlaintextCacheKeys(message: Message, signalContent: MessageContent | any): string[] {
@@ -315,23 +318,14 @@ export class ChatManager {
         return undefined
     }
 
-    clearLegacyE2EEPlaintextLocalStorage() {
+    getE2EEPlaintextLocalStorage(): Storage | undefined {
         try {
             if (typeof localStorage === "undefined") {
-                return
+                return undefined
             }
-            const keys: string[] = []
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i)
-                if (key && key.indexOf("wk_e2ee_plaintext:") === 0) {
-                    keys.push(key)
-                }
-            }
-            for (const key of keys) {
-                localStorage.removeItem(key)
-            }
+            return localStorage
         } catch (_error) {
-            // Ignore legacy cache cleanup failures.
+            return undefined
         }
     }
 
