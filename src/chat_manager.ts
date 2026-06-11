@@ -1,7 +1,7 @@
 import { MessageContentType } from "./const";
 import { Guid } from "./guid";
 import WKSDK from "./index";
-import { Channel, ChannelTypePerson, MediaMessageContent, Message, MessageContent, SyncOptions, MessageSignalContent } from "./model";
+import { Channel, ChannelTypePerson, MediaMessageContent, Message, MessageContent, SyncOptions, MessageSignalContent, MessageText } from "./model";
 import { Packet, RecvackPacket, RecvPacket, SendackPacket, SendPacket, Setting } from "./proto";
 import { Task, MessageTask, TaskStatus } from "./task";
 import { Md5 } from "md5-typescript";
@@ -18,6 +18,8 @@ export class ChatManager {
     sendTimer: any // 发送定时器
     sendStatusListeners: MessageStatusListener[] = new Array(); // 消息状态监听
     clientSeq: number = 0
+    private e2eePlaintextMemoryCache: Map<string, string> = new Map()
+    private e2eePlaintextSessionTTL: number = 12 * 60 * 60 * 1000
 
     private static instance: ChatManager
     public static shared() {
@@ -60,6 +62,8 @@ export class ChatManager {
             // const setting = Setting.fromUint8(recvPacket.setting)
 
             const message = new Message(recvPacket)
+            this.debugRawReceivedMessage(message)
+            await this.decryptMessageIfNeeded(message)
             this.sendRecvackPacket(recvPacket);
             if (message.contentType === MessageContentType.cmd) { // 命令类消息分流处理
                 this.notifyCMDListeners(message);
@@ -80,7 +84,13 @@ export class ChatManager {
         if (!WKSDK.shared().config.provider.syncMessagesCallback) {
             throw new Error("没有设置WKSDK.shared().config.provider.syncMessagesCallback")
         }
-        return WKSDK.shared().config.provider.syncMessagesCallback!(channel, opts)
+        const messages = await WKSDK.shared().config.provider.syncMessagesCallback!(channel, opts)
+        if (messages && messages.length > 0) {
+            for (const message of messages) {
+                await this.decryptMessageIfNeeded(message)
+            }
+        }
+        return messages
     }
 
     async syncMessageExtras(channel: Channel, extraVersion: number) {
@@ -114,14 +124,19 @@ export class ChatManager {
     }
 
     async sendWithOptions(content: MessageContent, channel: Channel, opts: SendOptions) {
-        const packet = this.getSendPacketWithOptions(content, channel, opts)
+        const finalContent = await this.prepareContentForSend(content, channel)
+        const packet = this.getSendPacketWithOptions(finalContent, channel, opts)
+        const localContent = this.isSignalMessageContent(finalContent) ? content : finalContent
 
         this.sendingQueues.set(packet.clientSeq, packet);
 
-        const message = Message.fromSendPacket(packet, content)
-        if (content instanceof MediaMessageContent) {
-            if(!content.file) { // 没有文件，直接上传
-                console.log("不需要上传",content.remoteUrl)
+        const message = Message.fromSendPacket(packet, localContent)
+        if (this.isSignalMessageContent(finalContent)) {
+            this.cacheE2EEPlaintext(message, finalContent, content)
+        }
+        if (finalContent instanceof MediaMessageContent) {
+            if(!finalContent.file) { // 没有文件，直接上传
+                console.log("不需要上传",finalContent.remoteUrl)
                 this.sendSendPacket(packet)
             }else {
                 console.log("开始上传")
@@ -140,6 +155,274 @@ export class ChatManager {
         this.notifyMessageListeners(message)
 
         return message
+    }
+
+    async prepareContentForSend(content: MessageContent, channel: Channel): Promise<MessageContent> {
+        const sdk = WKSDK.shared()
+        const channelInfo = sdk.channelManager.getChannelInfo(channel)
+        const plan = await sdk.config.e2ee.resolveSendPlan(channel, content, {
+            channelInfo,
+            refreshChannelInfo: async (target: Channel) => {
+                await sdk.channelManager.fetchChannelInfo(target)
+                return sdk.channelManager.getChannelInfo(target)
+            },
+        })
+
+        if (plan.action === "plaintext") {
+            return content
+        }
+        if (content instanceof MediaMessageContent) {
+            throw new Error("E2EE media message encryption is unavailable")
+        }
+        if (plan.action === "block") {
+            throw new Error(plan.reason || "E2EE send blocked")
+        }
+        return sdk.config.e2ee.encryptMessage(content, channel)
+    }
+
+    async decryptMessageIfNeeded(message: Message): Promise<void> {
+        if (!this.isSignalMessageContent(message.content)) {
+            return
+        }
+        const signalContent = message.content
+        const cachedContent = this.restoreCachedE2EEPlaintext(message, signalContent)
+        if (cachedContent) {
+            message.content = cachedContent
+            ;(message as any).e2eeDecryptFailed = false
+            this.debugE2EEDecrypt("cache", message, message.content)
+            return
+        }
+        this.debugE2EEDecrypt("before", message, message.content)
+        try {
+            message.content = await WKSDK.shared().config.e2ee.decryptMessage(message.content, message.channel, {
+                message,
+                fromUID: message.fromUID,
+                senderDeviceId: signalContent.senderDeviceId,
+            })
+            this.cacheE2EEPlaintext(message, signalContent, message.content)
+            this.debugE2EEDecrypt("after", message, message.content)
+            ;(message as any).e2eeDecryptFailed = false
+        } catch (error) {
+            ;(message as any).e2eeDecryptFailed = true
+            ;(message as any).e2eeDecryptError = error
+            this.debugE2EEDecryptFailure(message, message.content, error)
+            console.error("[E2EE] decrypt failed", {
+                channelID: message.channel && message.channel.channelID,
+                channelType: message.channel && message.channel.channelType,
+                fromUID: message.fromUID,
+                senderDeviceId: message.content.senderDeviceId,
+                messageID: message.messageID,
+                clientMsgNo: message.clientMsgNo,
+            }, error)
+            message.content = this.buildE2EEDecryptFailureContent(error)
+        }
+    }
+
+    buildE2EEDecryptFailureContent(_error: any): MessageText {
+        return new MessageText("[E2EE] 消息无法解密或无权限查看")
+    }
+
+    isSignalMessageContent(content: MessageContent | any): boolean {
+        return content instanceof MessageSignalContent || (content && content.contentType === MessageContentType.signalMessage)
+    }
+
+    cacheE2EEPlaintext(message: Message, signalContent: MessageContent | any, plaintextContent: MessageContent) {
+        this.clearLegacyE2EEPlaintextLocalStorage()
+        if (!plaintextContent) {
+            return
+        }
+        const keys = this.e2eePlaintextCacheKeys(message, signalContent)
+        if (keys.length === 0) {
+            return
+        }
+        try {
+            const payload = plaintextContent.encodeJSON ? plaintextContent.encodeJSON() : {}
+            const now = Date.now()
+            const value = JSON.stringify({
+                type: plaintextContent.contentType,
+                payload,
+                cachedAt: now,
+                expiresAt: now + this.e2eePlaintextSessionTTL,
+            })
+            for (const key of keys) {
+                this.e2eePlaintextMemoryCache.set(key, value)
+                this.getE2EEPlaintextSessionStorage()?.setItem(key, value)
+            }
+        } catch (error) {
+            if (WKSDK.shared().config.debug) {
+                console.warn("[E2EE] plaintext cache write failed", error)
+            }
+        }
+    }
+
+    restoreCachedE2EEPlaintext(message: Message, signalContent: MessageContent | any): MessageContent | undefined {
+        this.clearLegacyE2EEPlaintextLocalStorage()
+        for (const key of this.e2eePlaintextCacheKeys(message, signalContent)) {
+            const cached = this.e2eePlaintextMemoryCache.get(key) || this.getE2EEPlaintextSessionStorage()?.getItem(key)
+            if (!cached) {
+                continue
+            }
+            try {
+                const data = JSON.parse(cached)
+                if (data.expiresAt && Number(data.expiresAt) < Date.now()) {
+                    this.e2eePlaintextMemoryCache.delete(key)
+                    this.getE2EEPlaintextSessionStorage()?.removeItem(key)
+                    continue
+                }
+                const contentType = Number(data.type || signalContent.realContentType)
+                const content = WKSDK.shared().getMessageContent(contentType)
+                const payload = data.payload || {}
+                payload.type = contentType
+                content.decode(this.stringToUint8Array(JSON.stringify(payload)))
+                return content
+            } catch (error) {
+                this.e2eePlaintextMemoryCache.delete(key)
+                this.getE2EEPlaintextSessionStorage()?.removeItem(key)
+                if (WKSDK.shared().config.debug) {
+                    console.warn("[E2EE] plaintext cache read failed", error)
+                }
+            }
+        }
+        return undefined
+    }
+
+    e2eePlaintextCacheKeys(message: Message, signalContent: MessageContent | any): string[] {
+        const uid = WKSDK.shared().config.uid || ""
+        const deviceId = WKSDK.shared().config.e2ee?.currentOptions?.deviceId || ""
+        const keys: string[] = []
+        const prefix = `wk_e2ee_plaintext:${uid}:${deviceId}:`
+        if (message.messageID) {
+            keys.push(`${prefix}mid:${message.messageID}`)
+        }
+        if (message.clientMsgNo) {
+            keys.push(`${prefix}cno:${message.clientMsgNo}`)
+        }
+        const ciphertext = signalContent && signalContent.ciphertext
+        if (ciphertext) {
+            keys.push(`${prefix}ct:${this.hashString(String(ciphertext))}`)
+        }
+        return keys
+    }
+
+    getE2EEPlaintextSessionStorage(): Storage | undefined {
+        try {
+            if (typeof sessionStorage !== "undefined") {
+                return sessionStorage
+            }
+        } catch (_error) {
+            return undefined
+        }
+        return undefined
+    }
+
+    clearLegacyE2EEPlaintextLocalStorage() {
+        try {
+            if (typeof localStorage === "undefined") {
+                return
+            }
+            const keys: string[] = []
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i)
+                if (key && key.indexOf("wk_e2ee_plaintext:") === 0) {
+                    keys.push(key)
+                }
+            }
+            for (const key of keys) {
+                localStorage.removeItem(key)
+            }
+        } catch (_error) {
+            // Ignore legacy cache cleanup failures.
+        }
+    }
+
+    hashString(value: string): string {
+        let hash = 0
+        for (let i = 0; i < value.length; i++) {
+            hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0
+        }
+        return String(hash >>> 0)
+    }
+
+    stringToUint8Array(str: string): Uint8Array {
+        const newStr = unescape(encodeURIComponent(str))
+        const arr = new Array<number>()
+        for (let i = 0, j = newStr.length; i < j; ++i) {
+            arr.push(newStr.charCodeAt(i))
+        }
+        return new Uint8Array(arr)
+    }
+
+    debugRawReceivedMessage(message: Message) {
+        if (!WKSDK.shared().config.debug) {
+            return
+        }
+        console.log("[E2EE][recv raw]", {
+            channelID: message.channel && message.channel.channelID,
+            channelType: message.channel && message.channel.channelType,
+            fromUID: message.fromUID,
+            messageID: message.messageID,
+            messageSeq: message.messageSeq,
+            clientMsgNo: message.clientMsgNo,
+            contentType: message.contentType,
+            content: this.toDebugContent(message.content),
+        })
+    }
+
+    debugE2EEDecrypt(stage: string, message: Message, content: MessageContent) {
+        if (!WKSDK.shared().config.debug) {
+            return
+        }
+        console.log(`[E2EE] decrypt ${stage}`, {
+            channelID: message.channel && message.channel.channelID,
+            channelType: message.channel && message.channel.channelType,
+            fromUID: message.fromUID,
+            messageID: message.messageID,
+            clientMsgNo: message.clientMsgNo,
+            content: this.toDebugContent(content),
+        })
+    }
+
+    debugE2EEDecryptFailure(message: Message, content: MessageContent, error: any) {
+        if (!WKSDK.shared().config.debug) {
+            return
+        }
+        console.log("[E2EE] decrypt failed detail", {
+            channelID: message.channel && message.channel.channelID,
+            channelType: message.channel && message.channel.channelType,
+            fromUID: message.fromUID,
+            messageID: message.messageID,
+            clientMsgNo: message.clientMsgNo,
+            error: error && error.message ? error.message : String(error),
+            content: this.toDebugContent(content),
+        })
+    }
+
+    toDebugContent(content: MessageContent | any) {
+        if (!content) {
+            return null
+        }
+        const data: any = {
+            contentType: content.contentType,
+            contentClass: content.constructor && content.constructor.name,
+        }
+        if (this.isSignalMessageContent(content)) {
+            data.messageType = content.messageType
+            data.realContentType = content.realContentType
+            data.senderDeviceId = content.senderDeviceId
+            data.ciphertext = content.ciphertext
+            return data
+        }
+        if (typeof content.text === "string") {
+            data.text = content.text
+        }
+        if (typeof content.encodeJSON === "function") {
+            try {
+                data.payload = content.encodeJSON()
+            } catch (error) {
+                data.payloadError = error && (error as any).message ? (error as any).message : String(error)
+            }
+        }
+        return data
     }
 
     sendSendPacket(p: SendPacket) {

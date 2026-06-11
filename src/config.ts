@@ -1,5 +1,7 @@
 import Proto, { IProto } from "./proto"
 import { Provider } from "./provider"
+import { E2EEManager } from "./e2ee/e2ee_manager"
+import type { E2EEInitOptions } from "./e2ee/e2ee_types"
 
 export class WKConfig {
     constructor() {
@@ -14,6 +16,7 @@ export class WKConfig {
     proto: IProto = new Proto();
     heartbeatInterval: number = 60000; // 心跳频率 单位毫秒
     provider!: Provider
+    e2ee: E2EEManager = new E2EEManager()
     receiptFlushInterval:number = 2000 // 回执flush间隔 单位为毫秒ms
     sdkVersion = "1.2.8" // SDK版本号
     platform?:any // 运行平台的全局对象，比如unapp的是 uni ， 微信的是 wx
@@ -21,4 +24,7 @@ export class WKConfig {
     sendCountOfEach = 5  // 每次同时发送消息数量
     clientMsgDeviceId = 0 // 客户端消息设备id, 如果设置了每条消息的clientMsgNo里将带这个标记
 
+    async initE2EE(options: E2EEInitOptions): Promise<void> {
+        await this.e2ee.initialize(options)
+    }
 }

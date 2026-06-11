@@ -338,6 +338,8 @@ export class ChannelInfo {
     orgData: any; // 频道原生数据
     online: boolean = false // 是否在线
     lastOffline: number = 0 // 最后一次离线时间
+    isE2e?: boolean
+    e2eEnabledAt?: number
 }
 export class Conversation {
     channel!: Channel; // 频道
@@ -346,6 +348,7 @@ export class Conversation {
     timestamp: number = 0
     lastMessage?: Message; // 最后一条消息
     extra?: any // 扩展数据（用户自定义的数据）
+    isE2e?: boolean
     _remoteExtra!: ConversationExtra // 远程扩展数据
     private _isMentionMe?: boolean; // 是否有人@我
     private _reminders = new Array<Reminder>() // 提醒项
@@ -676,8 +679,36 @@ export class MessageStream extends MessageContent {
 }
 
 export class MessageSignalContent extends MessageContent {
+    ciphertext: string = ""
+    messageType: string = ""
+    realContentType: number = 0
+    senderDeviceId?: string | number
+
     public get contentType(): number {
         return MessageContentType.signalMessage
+    }
+
+    public get conversationDigest(): string {
+        return "[Encrypted Message]"
+    }
+
+    public decodeJSON(content: any) {
+        this.ciphertext = content["ciphertext"] || ""
+        this.messageType = content["message_type"] || content["messageType"] || ""
+        this.realContentType = content["real_content_type"] || content["realContentType"] || 0
+        this.senderDeviceId = content["sender_device_id"] || content["senderDeviceId"]
+    }
+
+    public encodeJSON(): any {
+        const data: any = {
+            ciphertext: this.ciphertext,
+            message_type: this.messageType,
+            real_content_type: this.realContentType,
+        }
+        if (this.senderDeviceId !== undefined && this.senderDeviceId !== null) {
+            data["sender_device_id"] = this.senderDeviceId
+        }
+        return data
     }
 }
 

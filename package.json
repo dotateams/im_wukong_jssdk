@@ -1,6 +1,10 @@
 {
   "name": "wukongimjssdk",
-  "version": "1.2.11",
+  "version": "1.2.12-e2ee.0",
+  "wkE2EE": {
+    "internalPackage": true,
+    "publicBaseVersion": "1.2.11"
+  },
   "description": "",
   "main": "lib/wukongimjssdk.cjs.js",
   "module": "lib/wukongimjssdk.esm.js",
@@ -27,7 +31,11 @@
     "dev": "rollup -c -w",
     "format": "prettier --write \"src/**/*.ts\"",
     "lint": "tslint -p tsconfig.json",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/run-tests.js",
+    "assert:internal-package": "node scripts/assert-internal-package.js"
+  },
+  "publishConfig": {
+    "tag": "e2ee"
   },
   "author": "tangtao",
   "license": "ISC",
@@ -55,12 +63,14 @@
     "webpack": "^4.42.0"
   },
   "dependencies": {
+    "@privacyresearch/libsignal-protocol-typescript": "^0.0.16",
     "@types/bignumber.js": "^5.0.0",
     "@types/crypto-js": "^4.0.2",
     "bignumber.js": "^9.0.1",
     "buffer": "^6.0.3",
     "crypto-js": "^4.1.1",
     "curve25519-js": "^0.0.4",
+    "idb": "^8.0.3",
     "md5-typescript": "^1.0.5"
   },
   "files": [

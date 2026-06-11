@@ -50,7 +50,14 @@ export class ConversationManager {
     sync(filter?: any): Promise<Conversation[]> {
         const syncProvide = WKSDK.shared().config.provider.syncConversationsCallback(filter)
         if (syncProvide) {
-            syncProvide.then((conversations) => {
+            const handledSync = syncProvide.then(async (conversations) => {
+                if (conversations && conversations.length > 0) {
+                    for (const conversation of conversations) {
+                        if (conversation.lastMessage) {
+                            await ChatManager.shared().decryptMessageIfNeeded(conversation.lastMessage)
+                        }
+                    }
+                }
                 this.conversations = conversations
                 if (conversations.length > 0) {
                     for (const conversation of conversations) {
@@ -60,9 +67,12 @@ export class ConversationManager {
                     }
                 }
                 WKSDK.shared().reminderManager.sync()
+                return conversations
             }).catch((err) => {
                 console.log('同步最近会话失败！', err)
+                throw err
             })
+            return handledSync
         }
         return syncProvide
     }
