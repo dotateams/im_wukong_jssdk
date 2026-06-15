@@ -24,6 +24,7 @@ function resetSdk() {
     sdk.config.e2ee.reset();
     sdk.channelManager.channelInfocacheMap = {};
     (sdk.chatManager as any).e2eePlaintextMemoryCache?.clear?.();
+    (sdk.chatManager as any).e2eeDecryptFailureMemoryCache?.clear?.();
     try {
         (globalThis as any).localStorage?.clear?.();
         (globalThis as any).sessionStorage?.clear?.();
@@ -388,6 +389,47 @@ test("e2ee_chat_manager downgrades invalid cached encrypted media without throwi
     assert.equal((message as any).e2eeDecryptFailed, true);
     assert.equal(message.content.contentType, MessageContentType.text);
     assert.equal(localStore.has(cacheKey), false);
+});
+
+test("e2ee_chat_manager suppresses repeated missing sender key errors for the same history message", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    cacheChannelInfo(channel, true);
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                throw new Error("Missing sender key");
+            },
+        },
+    });
+
+    const oldError = console.error;
+    const errors: any[] = [];
+    try {
+        console.error = (...args: any[]) => {
+            errors.push(args);
+        };
+
+        for (let i = 0; i < 2; i++) {
+            const message = new Message();
+            message.channel = channel;
+            message.fromUID = "receiver";
+            message.messageID = "history-missing-key-1";
+            message.content = signalContent("signal_group");
+            await sdk.chatManager.decryptMessageIfNeeded(message);
+
+            assert.equal((message as any).e2eeDecryptFailed, true);
+            assert.equal(message.content.contentType, MessageContentType.text);
+            assert.ok((message.content as MessageText).text.indexOf("群密钥") >= 0);
+        }
+    } finally {
+        console.error = oldError;
+    }
+
+    assert.equal(errors.length, 1);
 });
 
 test("e2ee_media unwraps server encrypted file responses before media decrypt", async () => {

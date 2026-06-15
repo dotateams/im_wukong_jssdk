@@ -20,6 +20,8 @@ export class ChatManager {
     clientSeq: number = 0
     private e2eePlaintextMemoryCache: Map<string, string> = new Map()
     private e2eePlaintextSessionTTL: number = 12 * 60 * 60 * 1000
+    private e2eeDecryptFailureMemoryCache: Map<string, number> = new Map()
+    private e2eeDecryptFailureTTL: number = 10 * 60 * 1000
 
     private static instance: ChatManager
     public static shared() {
@@ -209,6 +211,12 @@ export class ChatManager {
             return
         }
         this.debugE2EEDecrypt("before", message, message.content)
+        if (this.isRecentE2EEDecryptFailure(message, signalContent)) {
+            ;(message as any).e2eeDecryptFailed = true
+            ;(message as any).e2eeDecryptError = new Error("Missing sender key")
+            message.content = this.buildE2EEDecryptFailureContent((message as any).e2eeDecryptError)
+            return
+        }
         try {
             message.content = await WKSDK.shared().config.e2ee.decryptMessage(message.content, message.channel, {
                 message,
@@ -222,19 +230,25 @@ export class ChatManager {
             ;(message as any).e2eeDecryptFailed = true
             ;(message as any).e2eeDecryptError = error
             this.debugE2EEDecryptFailure(message, message.content, error)
-            console.error("[E2EE] decrypt failed", {
-                channelID: message.channel && message.channel.channelID,
-                channelType: message.channel && message.channel.channelType,
-                fromUID: message.fromUID,
-                senderDeviceId: message.content.senderDeviceId,
-                messageID: message.messageID,
-                clientMsgNo: message.clientMsgNo,
-            }, error)
+            const shouldLog = this.markE2EEDecryptFailureIfNeeded(message, message.content, error)
+            if (shouldLog) {
+                console.error("[E2EE] decrypt failed", {
+                    channelID: message.channel && message.channel.channelID,
+                    channelType: message.channel && message.channel.channelType,
+                    fromUID: message.fromUID,
+                    senderDeviceId: message.content.senderDeviceId,
+                    messageID: message.messageID,
+                    clientMsgNo: message.clientMsgNo,
+                }, error)
+            }
             message.content = this.buildE2EEDecryptFailureContent(error)
         }
     }
 
-    buildE2EEDecryptFailureContent(_error: any): MessageText {
+    buildE2EEDecryptFailureContent(error: any): MessageText {
+        if (this.isMissingSenderKeyError(error)) {
+            return new MessageText("[E2EE] 该历史消息缺少群密钥，无法在当前设备解密")
+        }
         return new MessageText("[E2EE] 消息无法解密或无权限查看")
     }
 
@@ -312,6 +326,56 @@ export class ChatManager {
         for (const key of this.e2eePlaintextCacheKeys(message, signalContent)) {
             this.removeE2EEPlaintextCacheKey(key)
         }
+    }
+
+    private markE2EEDecryptFailureIfNeeded(message: Message, signalContent: MessageContent | any, error: any): boolean {
+        if (!this.isMissingSenderKeyError(error)) {
+            return true
+        }
+        const key = this.e2eeDecryptFailureCacheKey(message, signalContent)
+        if (!key) {
+            return true
+        }
+        const now = Date.now()
+        const lastFailedAt = this.e2eeDecryptFailureMemoryCache.get(key)
+        this.e2eeDecryptFailureMemoryCache.set(key, now)
+        return !lastFailedAt || now - lastFailedAt > this.e2eeDecryptFailureTTL
+    }
+
+    private isRecentE2EEDecryptFailure(message: Message, signalContent: MessageContent | any): boolean {
+        const key = this.e2eeDecryptFailureCacheKey(message, signalContent)
+        if (!key) {
+            return false
+        }
+        const failedAt = this.e2eeDecryptFailureMemoryCache.get(key)
+        if (!failedAt) {
+            return false
+        }
+        if (Date.now() - failedAt > this.e2eeDecryptFailureTTL) {
+            this.e2eeDecryptFailureMemoryCache.delete(key)
+            return false
+        }
+        return true
+    }
+
+    private e2eeDecryptFailureCacheKey(message: Message, signalContent: MessageContent | any): string {
+        const channelID = message.channel && message.channel.channelID
+        const channelType = message.channel && message.channel.channelType
+        const senderDeviceId = signalContent && signalContent.senderDeviceId
+        const messageID = message.messageID || message.clientMsgNo
+        if (!channelID || !messageID) {
+            const ciphertext = signalContent && signalContent.ciphertext
+            if (!channelID || !ciphertext) {
+                return ""
+            }
+            return `${channelID}:${channelType || ""}:${message.fromUID || ""}:${senderDeviceId || ""}:ct:${this.hashString(String(ciphertext))}`
+        }
+        return `${channelID}:${channelType || ""}:${message.fromUID || ""}:${senderDeviceId || ""}:mid:${messageID}`
+    }
+
+    private isMissingSenderKeyError(error: any): boolean {
+        const message = error && error.message ? String(error.message) : String(error || "")
+        return message.indexOf("Missing sender key") >= 0
     }
 
     e2eePlaintextCacheKeys(message: Message, signalContent: MessageContent | any): string[] {
