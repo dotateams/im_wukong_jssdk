@@ -139,3 +139,17 @@ test("group manager retries inline sender-key distribution for early messages", 
     assert.equal(bodies[3].msg_index, 3);
     assert.equal(bodies[3].distribution, undefined);
 });
+
+test("group manager member hash changes when e2ee member devices change", () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    const baseHash = manager.normalizeMemberHash(undefined, [
+        { uid: "alice", devices: [{ device_id: "alice-web" }] },
+        { uid: "bob", devices: [{ device_id: "bob-web-1" }] },
+    ]);
+    const reloginHash = manager.normalizeMemberHash(undefined, [
+        { uid: "alice", devices: [{ device_id: "alice-web" }] },
+        { uid: "bob", devices: [{ device_id: "bob-web-2" }] },
+    ]);
+
+    assert.notEqual(baseHash, reloginHash);
+});

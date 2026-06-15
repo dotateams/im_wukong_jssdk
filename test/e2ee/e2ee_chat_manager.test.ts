@@ -8,10 +8,13 @@ import {
     ChannelTypePerson,
     MediaMessageContent,
     Message,
+    MessageEncryptedMedia,
+    MessageImage,
     MessageSignalContent,
     MessageText,
 } from "../../src/model";
 import { MessageContentType } from "../../src/const";
+import { E2EEMediaCrypto } from "../../src/e2ee/e2ee_media";
 
 declare const test: (name: string, fn: () => void | Promise<void>) => void;
 
@@ -139,7 +142,211 @@ test("e2ee_chat_manager enabled channel blocks send when encryption is unavailab
     );
 });
 
-test("e2ee_chat_manager blocks media messages in enabled channels until media encryption is available", async () => {
+function testFile(parts: any[], name: string, type: string): File {
+    if (typeof File !== "undefined") {
+        return new File(parts, name, { type });
+    }
+    const blob: any = new Blob(parts, { type });
+    blob.name = name;
+    return blob as File;
+}
+
+function installMediaProvider(store: Map<string, Blob>) {
+    let index = 0;
+    return {
+        uploadEncryptedMedia: async (file: Blob, context: any) => {
+            const url = `file/preview/chat/e2ee-${context.kind}-${++index}.bin`;
+            store.set(url, file);
+            return url;
+        },
+        fetchEncryptedMedia: async (url: string) => {
+            const blob = store.get(url);
+            if (!blob) {
+                throw new Error(`missing encrypted blob ${url}`);
+            }
+            return blob;
+        },
+        createThumbnail: async () => new Blob(["thumb"], { type: "image/jpeg" }),
+    };
+}
+
+function base64(bytes: Uint8Array): string {
+    return Buffer.from(bytes).toString("base64");
+}
+
+async function serverEncryptedFileResponse(blob: Blob): Promise<Response> {
+    const key = new Uint8Array(32);
+    const nonce = new Uint8Array(12);
+    crypto.getRandomValues(key);
+    crypto.getRandomValues(nonce);
+    const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const plaintextBase64 = Buffer.from(await blob.arrayBuffer()).toString("base64");
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce },
+        cryptoKey,
+        Buffer.from(plaintextBase64, "utf8"),
+    ));
+    const encryptedData = new Uint8Array(nonce.length + ciphertext.length);
+    encryptedData.set(nonce, 0);
+    encryptedData.set(ciphertext, nonce.length);
+    return new Response(JSON.stringify({
+        key: base64(key),
+        encrypted_data: base64(encryptedData),
+        total_length: encryptedData.length,
+    }), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+    });
+}
+
+test("e2ee_chat_manager encrypts media messages in enabled channels", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: installMediaProvider(mediaStore),
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                assert.equal(content.contentType, MessageContentType.encryptedMedia);
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                const signal = signalContent("signal_multi");
+                signal.realContentType = MessageContentType.encryptedMedia;
+                return signal;
+            },
+        },
+    });
+
+    const image = new MessageImage(testFile(["hello image"], "hello.png", "image/png"), 640, 480);
+    const finalContent = await sdk.chatManager.prepareContentForSend(image, channel);
+
+    assert.ok(finalContent instanceof MessageSignalContent);
+    assert.ok(encryptedMediaPayload);
+    assert.equal(encryptedMediaPayload!.originalContentType, MessageContentType.image);
+    assert.ok(encryptedMediaPayload!.original.url);
+    assert.ok(encryptedMediaPayload!.original.key);
+    assert.ok(encryptedMediaPayload!.thumb.url);
+    assert.ok(encryptedMediaPayload!.thumb.key);
+    assert.notEqual(encryptedMediaPayload!.original.key, encryptedMediaPayload!.thumb.key);
+    assert.equal(mediaStore.size, 2);
+});
+
+test("e2ee_chat_manager decrypts encrypted media to displayable content", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    const provider = installMediaProvider(mediaStore);
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: provider,
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                const signal = signalContent("signal_multi");
+                signal.realContentType = MessageContentType.encryptedMedia;
+                return signal;
+            },
+            decryptMessage: async () => encryptedMediaPayload!,
+        },
+    });
+
+    const image = new MessageImage(testFile(["hello image"], "hello.png", "image/png"), 640, 480);
+    await sdk.chatManager.prepareContentForSend(image, channel);
+    assert.ok(encryptedMediaPayload);
+
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "receiver";
+    message.clientMsgNo = "media-client-no";
+    message.content = signalContent("signal_multi");
+    (message.content as MessageSignalContent).realContentType = MessageContentType.encryptedMedia;
+
+    await sdk.chatManager.decryptMessageIfNeeded(message);
+
+    assert.equal(message.content.contentType, MessageContentType.image);
+    assert.equal((message.content as any).e2eeMedia.mediaKind, "image");
+    assert.ok(((message.content as any).url || "").indexOf("blob:") === 0);
+    const originalURL = await sdk.config.e2ee.loadMediaOriginal(message.content);
+    assert.ok(originalURL && originalURL.indexOf("blob:") === 0);
+});
+
+test("e2ee_chat_manager restores self-sent encrypted media history from metadata cache", async () => {
+    installStorageMock("localStorage");
+    installStorageMock("sessionStorage");
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    let signalForHistory: MessageSignalContent | undefined;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: installMediaProvider(mediaStore),
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                assert.equal(content.contentType, MessageContentType.encryptedMedia);
+                const signal = signalContent("signal_multi");
+                signal.realContentType = MessageContentType.encryptedMedia;
+                signalForHistory = signal;
+                return signal;
+            },
+            decryptMessage: async () => {
+                throw new Error("history should restore media from cache before decrypt");
+            },
+        },
+    });
+
+    const sentPackets: any[] = [];
+    const originalSend = sdk.chatManager.sendSendPacket;
+    try {
+        (sdk.chatManager as any).sendSendPacket = (packet: any) => {
+            sentPackets.push(packet);
+        };
+
+        const sent = await sdk.chatManager.sendWithOptions(
+            new MessageImage(testFile(["hello image"], "hello.png", "image/png"), 640, 480),
+            channel,
+            new SendOptions(),
+        );
+
+        assert.ok(signalForHistory);
+        assert.equal(sentPackets.length, 1);
+        assert.equal(sent.content.contentType, MessageContentType.image);
+
+        const plaintextCache = (sdk.chatManager as any).e2eePlaintextMemoryCache as Map<string, string>;
+        const cached = [...plaintextCache.values()].map((value) => JSON.parse(value));
+        assert.ok(cached.some((item) => item.type === MessageContentType.encryptedMedia));
+        assert.ok(cached.every((item) => !item.payload.file));
+        plaintextCache.clear();
+
+        const history = new Message();
+        history.channel = channel;
+        history.fromUID = "sender";
+        history.clientMsgNo = sent.clientMsgNo;
+        history.content = signalForHistory!;
+
+        await sdk.chatManager.decryptMessageIfNeeded(history);
+
+        assert.equal(history.content.contentType, MessageContentType.image);
+        assert.equal((history.content as any).e2eeMedia.mediaKind, "image");
+        assert.ok(((history.content as any).url || "").indexOf("blob:") === 0);
+    } finally {
+        (sdk.chatManager as any).sendSendPacket = originalSend;
+    }
+});
+
+test("e2ee_chat_manager downgrades invalid cached encrypted media without throwing", async () => {
+    const localStore = installStorageMock("localStorage");
+    installStorageMock("sessionStorage");
     const sdk = resetSdk();
     const channel = new Channel("receiver", ChannelTypePerson);
     cacheChannelInfo(channel, true);
@@ -148,16 +355,128 @@ test("e2ee_chat_manager blocks media messages in enabled channels until media en
         uid: "sender",
         deviceId: "web-device-1",
         cryptoAdapter: {
-            encryptMessage: async () => {
-                throw new Error("media should be blocked before adapter encryption");
+            decryptMessage: async () => {
+                throw new Error("invalid cached media should not fall through to decrypt");
             },
         },
     });
 
-    await assert.rejects(
-        () => sdk.chatManager.prepareContentForSend(new MediaMessageContent(), channel),
-        /media/i,
-    );
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "sender";
+    message.clientMsgNo = "bad-media-cache";
+    message.content = signalContent("signal_multi");
+    (message.content as MessageSignalContent).realContentType = MessageContentType.encryptedMedia;
+
+    const cacheKey = (sdk.chatManager as any).e2eePlaintextCacheKeys(message, message.content)[0];
+    localStore.set(cacheKey, JSON.stringify({
+        type: MessageContentType.encryptedMedia,
+        payload: {
+            version: 1,
+            media_kind: "image",
+            original_content_type: MessageContentType.image,
+            original: {
+                url: "file/preview/chat/bad.e2ee",
+            },
+        },
+        cachedAt: Date.now(),
+        expiresAt: Date.now() + 60000,
+    }));
+
+    await sdk.chatManager.decryptMessageIfNeeded(message);
+
+    assert.equal((message as any).e2eeDecryptFailed, true);
+    assert.equal(message.content.contentType, MessageContentType.text);
+    assert.equal(localStore.has(cacheKey), false);
+});
+
+test("e2ee_media unwraps server encrypted file responses before media decrypt", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    const provider = installMediaProvider(mediaStore);
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: provider,
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                return signalContent("signal_multi");
+            },
+        },
+    });
+
+    const image = new MessageImage(testFile(["hello image"], "hello.png", "image/png"), 640, 480);
+    await sdk.chatManager.prepareContentForSend(image, channel);
+    assert.ok(encryptedMediaPayload);
+
+    for (const part of [encryptedMediaPayload!.original, encryptedMediaPayload!.thumb]) {
+        const absoluteURL = `http://127.0.0.1/${part.url}`;
+        mediaStore.set(absoluteURL, mediaStore.get(part.url)!);
+        part.url = absoluteURL;
+    }
+
+    const oldFetch = (globalThis as any).fetch;
+    try {
+        (globalThis as any).fetch = async (url: string) => {
+            const blob = mediaStore.get(url);
+            if (!blob) {
+                throw new Error(`unexpected fetch ${url}`);
+            }
+            return serverEncryptedFileResponse(blob);
+        };
+
+        const restored = await new E2EEMediaCrypto().restoreContent(encryptedMediaPayload!);
+        assert.equal(restored.contentType, MessageContentType.image);
+        assert.equal((restored as any).e2eeMedia.mediaKind, "image");
+        assert.ok(((restored as any).url || "").indexOf("blob:") === 0);
+    } finally {
+        (globalThis as any).fetch = oldFetch;
+    }
+});
+
+test("e2ee_media default upload sends api auth headers", async () => {
+    const channel = new Channel("receiver", ChannelTypePerson);
+    const captured: any[] = [];
+    const oldFetch = (globalThis as any).fetch;
+    try {
+        (globalThis as any).fetch = async (_url: string, options: any) => {
+            captured.push(options);
+            return new Response(JSON.stringify({ path: "file/preview/chat/e2ee-original.bin" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            });
+        };
+
+        const crypto = new E2EEMediaCrypto({
+            apiClient: {
+                config: {
+                    tokenCallback: () => "token-from-callback",
+                },
+                get: async (path: string) => {
+                    assert.ok(path.indexOf("file/upload?") === 0);
+                    return { url: "http://127.0.0.1/upload" };
+                },
+            } as any,
+        });
+
+        const encrypted = await crypto.encryptContent(
+            new MessageImage(testFile(["hello image"], "hello.png", "image/png"), 640, 480),
+            channel,
+        );
+
+        assert.ok(encrypted.original.url);
+        assert.equal(captured.length, 1);
+        assert.equal(captured[0].method, "POST");
+        assert.equal(captured[0].headers.token, "token-from-callback");
+        assert.equal(captured[0].headers["bb-encrypt"], "");
+    } finally {
+        (globalThis as any).fetch = oldFetch;
+    }
 });
 
 test("e2ee_chat_manager sends encrypted packet while keeping local sent message plaintext", async () => {

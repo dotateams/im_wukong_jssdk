@@ -1,11 +1,13 @@
-import type { Channel, ChannelInfo, MessageContent } from "../model";
+import type { Channel, ChannelInfo, MediaMessageContent, MessageContent } from "../model";
 import { ChannelTypePerson } from "../model";
 import type { E2EEDecryptContext, E2EEInitOptions, E2EESendPlan, ResolveSendPlanOptions } from "./e2ee_types";
 import { SignalE2EEAdapter } from "./e2ee_signal_adapter";
 import { SignalProtocolManager } from "../signal/SignalProtocolManager";
+import { E2EEMediaCrypto } from "./e2ee_media";
 
 export class E2EEManager {
     private options?: E2EEInitOptions;
+    private mediaCrypto?: E2EEMediaCrypto;
 
     public get initialized(): boolean {
         return !!this.options;
@@ -23,6 +25,10 @@ export class E2EEManager {
             throw new Error("E2EE deviceId is required");
         }
         this.options = await this.normalizeOptions(options);
+        this.mediaCrypto = new E2EEMediaCrypto({
+            apiClient: this.options.apiClient,
+            provider: this.options.mediaProvider,
+        });
         if (options.apiClient && options.apiClient.registerDeviceKeys) {
             await options.apiClient.registerDeviceKeys(options);
         }
@@ -30,6 +36,7 @@ export class E2EEManager {
 
     public reset(): void {
         this.options = undefined;
+        this.mediaCrypto = undefined;
     }
 
     public async resolveSendPlan(
@@ -78,6 +85,20 @@ export class E2EEManager {
         return adapter.encryptMessage(content, channel);
     }
 
+    public canEncryptMedia(content: MessageContent): boolean {
+        return !!this.mediaCrypto && this.mediaCrypto.canEncrypt(content);
+    }
+
+    public async encryptMediaMessage(content: MediaMessageContent, channel: Channel): Promise<MessageContent> {
+        if (!this.mediaCrypto) {
+            throw new Error("E2EE media crypto is unavailable");
+        }
+        const encryptedMedia = await this.mediaCrypto.encryptContent(content, channel);
+        const encryptedSignal = await this.encryptMessage(encryptedMedia, channel);
+        ;(encryptedSignal as any).e2eePlaintextContent = encryptedMedia;
+        return encryptedSignal;
+    }
+
     public async decryptMessage(
         content: MessageContent,
         channel: Channel,
@@ -90,7 +111,33 @@ export class E2EEManager {
         if (!adapter || !adapter.decryptMessage) {
             throw new Error("E2EE decrypt adapter is unavailable");
         }
-        return adapter.decryptMessage(content, channel, context);
+        const decrypted = await adapter.decryptMessage(content, channel, context);
+        if (this.mediaCrypto && this.mediaCrypto.isEncryptedMedia(decrypted)) {
+            return this.mediaCrypto.restoreContent(decrypted as any);
+        }
+        return decrypted;
+    }
+
+    public shouldCachePlaintext(content: MessageContent): boolean {
+        if (!this.mediaCrypto) {
+            return true;
+        }
+        return !this.mediaCrypto.canEncrypt(content) &&
+            !this.mediaCrypto.isRestoredMedia(content);
+    }
+
+    public async restoreCachedPlaintext(content: MessageContent): Promise<MessageContent> {
+        if (this.mediaCrypto && this.mediaCrypto.isEncryptedMedia(content)) {
+            return this.mediaCrypto.restoreContent(content as any);
+        }
+        return content;
+    }
+
+    public async loadMediaOriginal(content: MessageContent): Promise<string | undefined> {
+        if (!this.mediaCrypto) {
+            return undefined;
+        }
+        return this.mediaCrypto.loadOriginal(content as any);
     }
 
     private async resolveChannelInfo(

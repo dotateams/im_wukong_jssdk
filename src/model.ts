@@ -712,6 +712,52 @@ export class MessageSignalContent extends MessageContent {
     }
 }
 
+export class MessageEncryptedMedia extends MessageContent {
+    version: number = 1
+    mediaKind: string = ""
+    originalContentType: number = 0
+    name: string = ""
+    original: any = {}
+    thumb?: any
+
+    public get contentType(): number {
+        return MessageContentType.encryptedMedia
+    }
+
+    public get conversationDigest(): string {
+        if (this.mediaKind === "gif") {
+            return "[动图]"
+        }
+        if (this.mediaKind === "sticker") {
+            return "[表情]"
+        }
+        return "[图片]"
+    }
+
+    public decodeJSON(content: any) {
+        this.version = Number(content["version"] || 1)
+        this.mediaKind = content["media_kind"] || content["mediaKind"] || ""
+        this.originalContentType = Number(content["original_content_type"] || content["originalContentType"] || 0)
+        this.name = content["name"] || ""
+        this.original = content["original"] || {}
+        this.thumb = content["thumb"]
+    }
+
+    public encodeJSON(): any {
+        const data: any = {
+            version: this.version || 1,
+            media_kind: this.mediaKind || "",
+            original_content_type: this.originalContentType || 0,
+            name: this.name || "",
+            original: this.original || {},
+        }
+        if (this.thumb) {
+            data.thumb = this.thumb
+        }
+        return data
+    }
+}
+
 /**
  * 未知
  */

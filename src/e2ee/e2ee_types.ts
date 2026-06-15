@@ -9,6 +9,22 @@ export interface E2EEApiClient {
     post?: (path: string, body?: any) => Promise<any>;
 }
 
+export interface E2EEMediaProvider {
+    uploadEncryptedMedia?: (file: Blob, context: {
+        channel: Channel;
+        kind: "original" | "thumb";
+        contentType: number;
+        fileName?: string;
+        mime?: string;
+    }) => Promise<string>;
+    fetchEncryptedMedia?: (url: string) => Promise<Blob>;
+    createThumbnail?: (file: Blob, context: {
+        contentType: number;
+        mediaKind: string;
+        maxSize: number;
+    }) => Promise<Blob | undefined>;
+}
+
 export interface E2EEDecryptContext {
     message?: Message;
     fromUID?: string;
@@ -27,6 +43,7 @@ export interface E2EEInitOptions {
     platform?: string;
     apiClient?: E2EEApiClient;
     cryptoAdapter?: E2EECryptoAdapter;
+    mediaProvider?: E2EEMediaProvider;
     autoCreateSignalAdapter?: boolean;
 }
 

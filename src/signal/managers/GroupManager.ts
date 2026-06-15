@@ -66,13 +66,20 @@ export class GroupManager {
     if (!Array.isArray(members) || members.length === 0) {
       return '';
     }
-    const uids: any[] = [];
+    const entries: any[] = [];
     for (const member of members) {
       if (member && member.uid) {
-        uids.push(member.uid);
+        const deviceIds = this.normalizeMemberDeviceIds(member);
+        if (deviceIds.length === 0) {
+          entries.push(`${member.uid}:`);
+        } else {
+          for (const deviceId of deviceIds) {
+            entries.push(`${member.uid}:${deviceId}`);
+          }
+        }
       }
     }
-    const unique = Array.from(new Set(uids)).sort();
+    const unique = Array.from(new Set(entries)).sort();
     if (unique.length === 0) {
       return '';
     }
@@ -88,17 +95,46 @@ export class GroupManager {
     if (!Array.isArray(members) || members.length === 0) {
       return '';
     }
-    const uids: any[] = [];
+    const entries: any[] = [];
     for (const member of members) {
       if (member && member.uid) {
-        uids.push(member.uid);
+        const deviceIds = this.normalizeMemberDeviceIds(member);
+        if (deviceIds.length === 0) {
+          entries.push(`${member.uid}:`);
+        } else {
+          for (const deviceId of deviceIds) {
+            entries.push(`${member.uid}:${deviceId}`);
+          }
+        }
       }
     }
-    const unique = Array.from(new Set(uids)).sort();
+    const unique = Array.from(new Set(entries)).sort();
     if (unique.length === 0) {
       return '';
     }
     return (CryptoJS as any).MD5(unique.join('|')).toString();
+  }
+
+  private normalizeMemberDeviceIds(member: any): string[] {
+    const rawDevices =
+      member.devices ||
+      member.device_ids ||
+      member.deviceIds ||
+      member.e2ee_devices ||
+      member.e2eeDevices ||
+      [];
+    const devices = Array.isArray(rawDevices) ? rawDevices : [];
+    const ids: string[] = [];
+    for (const device of devices) {
+      const deviceId =
+        device && typeof device === 'object'
+          ? device.device_id ?? device.deviceId ?? device.id
+          : device;
+      if (deviceId !== undefined && deviceId !== null && deviceId !== '') {
+        ids.push(String(deviceId));
+      }
+    }
+    return Array.from(new Set(ids)).sort();
   }
 
   async createSenderKeyState(existingRecord: any) {

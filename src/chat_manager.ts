@@ -132,7 +132,7 @@ export class ChatManager {
 
         const message = Message.fromSendPacket(packet, localContent)
         if (this.isSignalMessageContent(finalContent)) {
-            this.cacheE2EEPlaintext(message, finalContent, content)
+            this.cacheE2EEPlaintext(message, finalContent, (finalContent as any).e2eePlaintextContent || content)
         }
         if (finalContent instanceof MediaMessageContent) {
             if(!finalContent.file) { // 没有文件，直接上传
@@ -171,11 +171,11 @@ export class ChatManager {
         if (plan.action === "plaintext") {
             return content
         }
-        if (content instanceof MediaMessageContent) {
-            throw new Error("E2EE media message encryption is unavailable")
-        }
         if (plan.action === "block") {
             throw new Error(plan.reason || "E2EE send blocked")
+        }
+        if (content instanceof MediaMessageContent) {
+            return sdk.config.e2ee.encryptMediaMessage(content, channel)
         }
         return sdk.config.e2ee.encryptMessage(content, channel)
     }
@@ -187,9 +187,25 @@ export class ChatManager {
         const signalContent = message.content
         const cachedContent = this.restoreCachedE2EEPlaintext(message, signalContent)
         if (cachedContent) {
-            message.content = cachedContent
-            ;(message as any).e2eeDecryptFailed = false
-            this.debugE2EEDecrypt("cache", message, message.content)
+            try {
+                message.content = await WKSDK.shared().config.e2ee.restoreCachedPlaintext(cachedContent)
+                ;(message as any).e2eeDecryptFailed = false
+                this.debugE2EEDecrypt("cache", message, message.content)
+            } catch (error) {
+                this.removeE2EEPlaintextCacheKeys(message, signalContent)
+                ;(message as any).e2eeDecryptFailed = true
+                ;(message as any).e2eeDecryptError = error
+                this.debugE2EEDecryptFailure(message, cachedContent, error)
+                console.error("[E2EE] cached plaintext restore failed", {
+                    channelID: message.channel && message.channel.channelID,
+                    channelType: message.channel && message.channel.channelType,
+                    fromUID: message.fromUID,
+                    senderDeviceId: signalContent.senderDeviceId,
+                    messageID: message.messageID,
+                    clientMsgNo: message.clientMsgNo,
+                }, error)
+                message.content = this.buildE2EEDecryptFailureContent(error)
+            }
             return
         }
         this.debugE2EEDecrypt("before", message, message.content)
@@ -228,6 +244,9 @@ export class ChatManager {
 
     cacheE2EEPlaintext(message: Message, signalContent: MessageContent | any, plaintextContent: MessageContent) {
         if (!plaintextContent) {
+            return
+        }
+        if (WKSDK.shared().config.e2ee && !WKSDK.shared().config.e2ee.shouldCachePlaintext(plaintextContent)) {
             return
         }
         const keys = this.e2eePlaintextCacheKeys(message, signalContent)
@@ -287,6 +306,12 @@ export class ChatManager {
         this.e2eePlaintextMemoryCache.delete(key)
         this.getE2EEPlaintextSessionStorage()?.removeItem(key)
         this.getE2EEPlaintextLocalStorage()?.removeItem(key)
+    }
+
+    private removeE2EEPlaintextCacheKeys(message: Message, signalContent: MessageContent | any) {
+        for (const key of this.e2eePlaintextCacheKeys(message, signalContent)) {
+            this.removeE2EEPlaintextCacheKey(key)
+        }
     }
 
     e2eePlaintextCacheKeys(message: Message, signalContent: MessageContent | any): string[] {

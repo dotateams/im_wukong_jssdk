@@ -9,4 +9,5 @@ export class MessageContentType {
      // 20000 - 30000 为本地自定义消息
 
     static signalMessage:number = 21000 // signal
+    static encryptedMedia:number = 21001 // e2ee encrypted media envelope
 }
