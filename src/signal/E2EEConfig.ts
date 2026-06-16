@@ -8,6 +8,7 @@ export interface E2EEConfig {
 
   // 并发控制配置
   groupDistributionConcurrency: number;
+  senderKeyDistributionInterval: number;
   maxBatchSize: number;
   minBatchSize: number;
 
@@ -25,6 +26,7 @@ export interface E2EEConfig {
   // 缓存配置
   maxSenderKeyCacheSize: number;
   maxDistributionCacheSize: number;
+  senderKeyEnvelopeUploadCacheTTL: number;
   distributionCacheTTL: number;
   deviceCacheTTL: number;
 
@@ -52,6 +54,7 @@ export const DEFAULT_E2EE_CONFIG: E2EEConfig = {
 
   // 并发控制
   groupDistributionConcurrency: 8,
+  senderKeyDistributionInterval: 20,
   maxBatchSize: 16,
   minBatchSize: 4,
 
@@ -69,6 +72,7 @@ export const DEFAULT_E2EE_CONFIG: E2EEConfig = {
   // 缓存配置
   maxSenderKeyCacheSize: 1000,
   maxDistributionCacheSize: 500,
+  senderKeyEnvelopeUploadCacheTTL: 30 * 60 * 1000,
   distributionCacheTTL: 10 * 1000,
   deviceCacheTTL: 5 * 60 * 1000,
 

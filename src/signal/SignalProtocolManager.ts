@@ -290,6 +290,21 @@ export class SignalProtocolManager {
     return this.groupManager.decryptGroupDistributionObject(obj, remoteUid, remoteDeviceId)
   }
 
+  async uploadGroupSenderKeyEnvelopes(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    return this.apiClient.post('/e2e/group_sender_keys/envelopes', payload)
+  }
+
+  async lookupGroupSenderKeyEnvelope(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    const resp = await this.apiClient.post('/e2e/group_sender_keys/envelope/lookup', payload)
+    return this.getResponseData(resp)
+  }
+
   normalizeMemberHash(memberHash: any, members: any) {
     return this.groupManager.normalizeMemberHash(memberHash, members)
   }

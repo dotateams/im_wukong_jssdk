@@ -14,21 +14,30 @@ export class GroupManager {
   deviceId: any;
   groupEncryptionLocks: Map<any, any>;
   signalStore: SignalProtocolStoreClass;
+  groupEnvelopeRecoveryPromises: Map<string, Promise<boolean>>;
 
   // 智能缓存
   private senderKeyCache: SmartLRUCache<string, SenderKeyRecord>;
   private senderKeyStateCache: SmartLRUCache<string, any>;
+  private senderKeyEnvelopeUploadCache: SmartLRUCache<string, boolean>;
   private readonly senderKeyDistributionRetryWindow = 3;
+  private readonly senderKeyDistributionInterval: number;
+  private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
+  private readonly senderKeyEnvelopeRecoveryBaseDelayMs: number;
 
   constructor(parent: any, uid: any, deviceId: any) {
     this.parent = parent;
     this.uid = uid;
     this.deviceId = deviceId;
     this.groupEncryptionLocks = new Map();
+    this.groupEnvelopeRecoveryPromises = new Map();
     this.signalStore = new SignalProtocolStoreClass(uid, deviceId);
 
     // 初始化智能缓存
     const config = E2EEConfigManager.getInstance().getConfig();
+    this.senderKeyDistributionInterval = Math.max(0, Number(config.senderKeyDistributionInterval || 0));
+    this.senderKeyEnvelopeRecoveryMaxAttempts = Math.max(1, Number(config.maxDecryptRetries || 3));
+    this.senderKeyEnvelopeRecoveryBaseDelayMs = Math.max(1, Number(config.retryDelayMs || 1000));
     this.senderKeyCache = new SmartLRUCache({
       maxSize: config.maxSenderKeyCacheSize,
       ttlMs: config.sessionCacheTTL,
@@ -36,6 +45,10 @@ export class GroupManager {
     this.senderKeyStateCache = new SmartLRUCache({
       maxSize: 2000,
       ttlMs: 2 * 60 * 1000,
+    });
+    this.senderKeyEnvelopeUploadCache = new SmartLRUCache({
+      maxSize: config.maxDistributionCacheSize,
+      ttlMs: config.senderKeyEnvelopeUploadCacheTTL,
     });
   }
 
@@ -241,6 +254,7 @@ export class GroupManager {
           payload.distribution = distribution.distribution;
           payload.member_hash = distribution.member_hash;
           payload.kdf_ver = distribution.kdf_ver;
+          await this.uploadDistributionEnvelopes(groupId, distribution);
         }
       }
       // console.log("signal_group payload:", {
@@ -260,12 +274,89 @@ export class GroupManager {
     return await currentLock;
   }
 
+  async uploadDistributionEnvelopes(groupId: any, distribution: any): Promise<void> {
+    if (!this.parent || typeof this.parent.uploadGroupSenderKeyEnvelopes !== 'function') {
+      return;
+    }
+    const ciphertexts = distribution?.distribution?.ciphertexts;
+    if (!Array.isArray(ciphertexts) || ciphertexts.length === 0) {
+      return;
+    }
+    const envelopes: any[] = [];
+    for (const item of ciphertexts) {
+      const recipientUid = item.uid ?? item.recipient_uid ?? item.recipientUid;
+      const recipientDeviceId = item.device_id ?? item.deviceId ?? item.recipient_device_id ?? item.recipientDeviceId;
+      if (!recipientUid || recipientDeviceId === undefined || recipientDeviceId === null || recipientDeviceId === '') {
+        continue;
+      }
+      envelopes.push({
+        recipient_uid: recipientUid,
+        recipient_device_id: String(recipientDeviceId),
+        envelope: JSON.stringify(item),
+      });
+    }
+    if (envelopes.length === 0) {
+      return;
+    }
+    const uploadCacheKey = this.getSenderKeyEnvelopeUploadCacheKey(groupId, distribution, envelopes);
+    const uploadCache = this.getSenderKeyEnvelopeUploadCache();
+    if (uploadCacheKey && uploadCache.has(uploadCacheKey)) {
+      return;
+    }
+    try {
+      await this.parent.uploadGroupSenderKeyEnvelopes({
+        group_id: groupId,
+        sender_uid: this.uid,
+        sender_device_id: this.deviceId,
+        key_id: distribution.key_id ?? distribution.keyId,
+        envelopes,
+      });
+      if (uploadCacheKey) {
+        uploadCache.set(uploadCacheKey, true);
+      }
+    } catch (error) {
+      console.warn('[GroupManager] upload sender key envelopes failed', error);
+    }
+  }
+
+  private getSenderKeyEnvelopeUploadCache(): SmartLRUCache<string, boolean> {
+    if (!this.senderKeyEnvelopeUploadCache) {
+      const config = E2EEConfigManager.getInstance().getConfig();
+      this.senderKeyEnvelopeUploadCache = new SmartLRUCache({
+        maxSize: config.maxDistributionCacheSize,
+        ttlMs: config.senderKeyEnvelopeUploadCacheTTL,
+      });
+    }
+    return this.senderKeyEnvelopeUploadCache;
+  }
+
+  private getSenderKeyEnvelopeUploadCacheKey(groupId: any, distribution: any, envelopes: any[]): string {
+    const keyId = distribution?.key_id ?? distribution?.keyId;
+    if (keyId === undefined || keyId === null || keyId === '') {
+      return '';
+    }
+    const memberHash = distribution?.member_hash ?? distribution?.memberHash ?? '';
+    const recipients = envelopes
+      .map((item) => `${item.recipient_uid}:${item.recipient_device_id}`)
+      .sort()
+      .join('|');
+    const recipientsHash = (CryptoJS as any).MD5(recipients).toString();
+    return `${groupId}:${this.uid}:${this.deviceId}:${keyId}:${memberHash}:${recipientsHash}`;
+  }
+
   shouldRetrySenderKeyDistribution(record: any, payload: any): boolean {
     const state: any = record && typeof record.getState === 'function' ? record.getState() : null;
     if (!state || typeof payload?.msg_index !== 'number') {
       return false;
     }
-    return state.keyId === payload.key_id && payload.msg_index < this.senderKeyDistributionRetryWindow;
+    if (state.keyId !== payload.key_id) {
+      return false;
+    }
+    if (payload.msg_index < this.senderKeyDistributionRetryWindow) {
+      return true;
+    }
+    const interval = Math.max(0, Number((this as any).senderKeyDistributionInterval || 0));
+    return interval > 0 && payload.msg_index > 0 && payload.msg_index % interval === 0;
   }
 
   async buildDistributionPayloadForRecord(groupId: any, record: any, members: any, normalizedMemberHash: string) {
@@ -434,6 +525,7 @@ export class GroupManager {
       kdf_ver: state.kdfVersion,
       distribution: { type: 'signal_multi', ciphertexts },
     };
+    await this.uploadDistributionEnvelopes(groupId, payload);
     await this.saveSenderKeyRecord(groupId, this.uid, record, this.deviceId);
     return { type: 0, body: JSON.stringify(payload) };
   }
@@ -498,6 +590,12 @@ export class GroupManager {
         }
       }
     }
+    if (!this.hasSenderKeyState(record, obj?.key_id)) {
+      const recovered = await this.recoverSenderKeyFromEnvelope(obj, senderUid, senderDeviceId);
+      if (recovered) {
+        record = await this.loadSenderKeyRecord(groupId, senderUid, senderDeviceId);
+      }
+    }
     if (!record) {
       throw new Error('Missing sender key');
     }
@@ -505,6 +603,111 @@ export class GroupManager {
     const plaintext = await cipher.decrypt(obj);
     this.saveSenderKeyRecord(groupId, senderUid, record, senderDeviceId);
     return plaintext;
+  }
+
+  private hasSenderKeyState(record: any, keyId: any): boolean {
+    if (!record || keyId === undefined || keyId === null || keyId === '') {
+      return false;
+    }
+    if (typeof record.getStateByKeyId !== 'function') {
+      return true;
+    }
+    return !!record.getStateByKeyId(keyId);
+  }
+
+  async recoverSenderKeyFromEnvelope(obj: any, senderUid: string, senderDeviceId: any): Promise<boolean> {
+    if (!this.parent || typeof this.parent.lookupGroupSenderKeyEnvelope !== 'function') {
+      return false;
+    }
+    const groupId = obj?.group_id;
+    const keyId = obj?.key_id;
+    if (!groupId || !senderUid || !senderDeviceId || !keyId) {
+      return false;
+    }
+    if (!this.groupEnvelopeRecoveryPromises) {
+      this.groupEnvelopeRecoveryPromises = new Map();
+    }
+    const recoveryKey = `${groupId}:${senderUid}:${senderDeviceId}:${keyId}:${this.uid}:${this.deviceId}`;
+    const existing = this.groupEnvelopeRecoveryPromises.get(recoveryKey);
+    if (existing) {
+      return existing;
+    }
+    const promise = this.doRecoverSenderKeyFromEnvelope(groupId, senderUid, senderDeviceId, keyId)
+      .catch((error) => {
+        console.warn('[GroupManager] recover sender key envelope failed', error);
+        return false;
+      })
+      .finally(() => {
+        this.groupEnvelopeRecoveryPromises.delete(recoveryKey);
+      });
+    this.groupEnvelopeRecoveryPromises.set(recoveryKey, promise);
+    return promise;
+  }
+
+  private async doRecoverSenderKeyFromEnvelope(groupId: any, senderUid: string, senderDeviceId: any, keyId: any): Promise<boolean> {
+    const resp = await this.lookupGroupSenderKeyEnvelopeWithRetry({
+      group_id: groupId,
+      sender_uid: senderUid,
+      sender_device_id: senderDeviceId,
+      key_id: keyId,
+      recipient_uid: this.uid,
+      recipient_device_id: this.deviceId,
+    });
+    const rawEnvelope = resp?.envelope ?? resp?.data?.envelope;
+    if (!rawEnvelope) {
+      return false;
+    }
+    const envelope = typeof rawEnvelope === 'string' ? JSON.parse(rawEnvelope) : rawEnvelope;
+    let distributionPlain: any = null;
+    if (envelope.is_ecies || envelope.enc === 'aes-256-gcm') {
+      distributionPlain = await this.parent.decryptGroupDistributionForDevice(envelope);
+    } else {
+      distributionPlain = await this.parent.decryptSignalCipherMessage(senderUid, senderDeviceId, envelope.type, envelope.body);
+    }
+    const distributionMessage = SenderKeyDistributionMessage.fromString(distributionPlain);
+    if (!distributionMessage) {
+      return false;
+    }
+    const newState = SenderKeyState.fromDistribution(distributionMessage);
+    let record: any = await this.loadSenderKeyRecord(groupId, senderUid, senderDeviceId);
+    if (!record) {
+      record = new SenderKeyRecord({
+        memberHash: (distributionMessage as any).memberHash || '',
+        states: [],
+      });
+    } else {
+      record.memberHash = (distributionMessage as any).memberHash || record.memberHash || '';
+    }
+    record.addState(newState);
+    await this.saveSenderKeyRecord(groupId, senderUid, record, senderDeviceId);
+    return true;
+  }
+
+  private async lookupGroupSenderKeyEnvelopeWithRetry(payload: any): Promise<any> {
+    const maxAttempts = Math.max(1, Number((this as any).senderKeyEnvelopeRecoveryMaxAttempts || 3));
+    const baseDelay = Math.max(1, Number((this as any).senderKeyEnvelopeRecoveryBaseDelayMs || 1000));
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.parent.lookupGroupSenderKeyEnvelope(payload);
+      } catch (error) {
+        lastError = error;
+        if (this.isPermanentEnvelopeLookupError(error) || attempt >= maxAttempts) {
+          throw error;
+        }
+        await this.delay(Math.min(baseDelay * Math.pow(2, attempt - 1), 30000));
+      }
+    }
+    throw lastError;
+  }
+
+  private isPermanentEnvelopeLookupError(error: any): boolean {
+    const status = Number(error?.status ?? error?.code ?? error?.response?.status ?? 0);
+    return status === 403 || status === 404;
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   async decryptGroupDistributionObject(obj: any, remoteUid: string, remoteDeviceId: any) {
