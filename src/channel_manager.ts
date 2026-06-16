@@ -81,8 +81,9 @@ export class ChannelManager {
             let cacheSubscribers = this.subscribeCacheMap.get(channelKey);
             let version: number = 0;
             if (cacheSubscribers && cacheSubscribers.length > 0) {
-                const lastMember = cacheSubscribers[cacheSubscribers.length - 1];
-                version = lastMember.version;
+                version = cacheSubscribers.reduce((maxVersion, subscriber) => {
+                    return Math.max(maxVersion, subscriber.version || 0);
+                }, 0);
             } else {
                 cacheSubscribers = new Array();
             }
