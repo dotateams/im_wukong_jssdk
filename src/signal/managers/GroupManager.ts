@@ -20,6 +20,7 @@ export class GroupManager {
   private senderKeyCache: SmartLRUCache<string, SenderKeyRecord>;
   private senderKeyStateCache: SmartLRUCache<string, any>;
   private senderKeyEnvelopeUploadCache: SmartLRUCache<string, boolean>;
+  private senderKeyEnvelopeUploadPromises: Map<string, Promise<void>>;
   private readonly senderKeyDistributionRetryWindow = 1;
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
@@ -31,6 +32,7 @@ export class GroupManager {
     this.deviceId = deviceId;
     this.groupEncryptionLocks = new Map();
     this.groupEnvelopeRecoveryPromises = new Map();
+    this.senderKeyEnvelopeUploadPromises = new Map();
     this.signalStore = new SignalProtocolStoreClass(uid, deviceId);
 
     // 初始化智能缓存
@@ -303,7 +305,19 @@ export class GroupManager {
     if (uploadCacheKey && uploadCache.has(uploadCacheKey)) {
       return;
     }
-    try {
+    if (!this.senderKeyEnvelopeUploadPromises) {
+      this.senderKeyEnvelopeUploadPromises = new Map();
+    }
+    const pendingUpload = uploadCacheKey ? this.senderKeyEnvelopeUploadPromises.get(uploadCacheKey) : undefined;
+    if (pendingUpload) {
+      try {
+        await pendingUpload;
+      } catch (error) {
+        console.warn('[GroupManager] upload sender key envelopes failed', error);
+      }
+      return;
+    }
+    const doUpload = async () => {
       await this.parent.uploadGroupSenderKeyEnvelopes({
         group_id: groupId,
         sender_uid: this.uid,
@@ -314,8 +328,19 @@ export class GroupManager {
       if (uploadCacheKey) {
         uploadCache.set(uploadCacheKey, true);
       }
+    };
+    const uploadPromise = doUpload();
+    if (uploadCacheKey) {
+      this.senderKeyEnvelopeUploadPromises.set(uploadCacheKey, uploadPromise);
+    }
+    try {
+      await uploadPromise;
     } catch (error) {
       console.warn('[GroupManager] upload sender key envelopes failed', error);
+    } finally {
+      if (uploadCacheKey) {
+        this.senderKeyEnvelopeUploadPromises.delete(uploadCacheKey);
+      }
     }
   }
 
