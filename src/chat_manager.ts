@@ -512,21 +512,29 @@ export class ChatManager {
         this.sendPacketQueue.push(p)
         if(!this.sendTimer) {
             this.sendTimer = setInterval(() => {
-                const sendData = new Array<number>()
+                const sendChunks = new Array<Uint8Array>()
+                let sendDataLength = 0
                 let sendCount  = 0
                 while (this.sendPacketQueue.length > 0) {
                     const packet = this.sendPacketQueue.shift()
                     if(packet) {
-                        const packetData = Array.from(WKSDK.shared().config.proto.encode(packet))
-                        sendData.push(...packetData)
+                        const packetData = WKSDK.shared().config.proto.encode(packet)
+                        sendChunks.push(packetData)
+                        sendDataLength += packetData.length
                     }
                     sendCount++
                     if(sendCount >= WKSDK.shared().config.sendCountOfEach) {
                         break
                     }
                 }
-                if(sendData.length > 0) {
-                    WKSDK.shared().connectManager.send(new Uint8Array(sendData))
+                if(sendDataLength > 0) {
+                    const sendData = new Uint8Array(sendDataLength)
+                    let offset = 0
+                    for (const chunk of sendChunks) {
+                        sendData.set(chunk, offset)
+                        offset += chunk.length
+                    }
+                    WKSDK.shared().connectManager.send(sendData)
                 } 
             }, WKSDK.shared().config.sendFrequency)
         }

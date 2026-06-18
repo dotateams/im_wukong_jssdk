@@ -149,9 +149,7 @@ export class SendPacket extends Packet {
     return `${this.clientSeq}${this.clientMsgNo}${this.channelID ?? ""}${this.channelType}${payloadStr}`
   }
   private uint8ArrayToString(data: Uint8Array) {
-    const encodedString = String.fromCharCode.apply(null, Array.from(data));
-    const decodedString = decodeURIComponent(escape(encodedString));
-    return decodedString
+    return uint8ArrayToUtf8String(data)
   }
 }
 
@@ -187,10 +185,18 @@ export class RecvPacket extends Packet {
     return `${this.messageID}${this.messageSeq}${this.clientMsgNo}${this.timestamp}${this.fromUID ?? ""}${this.channelID ?? ""}${this.channelType}${payloadStr}`
   }
   private uint8ArrayToString(data: Uint8Array) {
-    const encodedString = String.fromCharCode.apply(null, Array.from(data));
-    const decodedString = decodeURIComponent(escape(encodedString));
-    return decodedString
+    return uint8ArrayToUtf8String(data)
   }
+}
+
+function uint8ArrayToUtf8String(data: Uint8Array) {
+  const chunkSize = 0x8000
+  const parts: string[] = []
+  for (let offset = 0; offset < data.length; offset += chunkSize) {
+    const chunk = data.subarray(offset, offset + chunkSize)
+    parts.push(String.fromCharCode(...Array.from(chunk)))
+  }
+  return decodeURIComponent(escape(parts.join('')))
 }
 // ping
 export class PingPacket extends Packet {

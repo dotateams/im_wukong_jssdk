@@ -8,7 +8,7 @@ export default class Encoder {
     this.w.push(b);
   }
   writeBytes(b: number[]) {
-    this.w.push(...b);
+    this.pushBytes(b);
   }
   /* tslint:disable */
   writeInt64(b: BigNumber) {
@@ -44,7 +44,7 @@ export default class Encoder {
     if (s && s.length>0) {
       let strArray = this.stringToUint(s);
       this.writeInt16(strArray.length);
-      this.w.push(...strArray);
+      this.pushBytes(strArray);
     } else {
       this.writeInt16(0x00);
     }
@@ -62,5 +62,12 @@ export default class Encoder {
 
   toUint8Array() {
     return new Uint8Array(this.w);
+  }
+
+  private pushBytes(bytes: number[]) {
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      this.w.push(...bytes.slice(offset, offset + chunkSize));
+    }
   }
 }

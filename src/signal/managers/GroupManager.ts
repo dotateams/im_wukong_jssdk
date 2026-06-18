@@ -20,7 +20,7 @@ export class GroupManager {
   private senderKeyCache: SmartLRUCache<string, SenderKeyRecord>;
   private senderKeyStateCache: SmartLRUCache<string, any>;
   private senderKeyEnvelopeUploadCache: SmartLRUCache<string, boolean>;
-  private readonly senderKeyDistributionRetryWindow = 3;
+  private readonly senderKeyDistributionRetryWindow = 1;
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
   private readonly senderKeyEnvelopeRecoveryBaseDelayMs: number;

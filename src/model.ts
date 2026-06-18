@@ -296,7 +296,13 @@ function stringToUint8Array(str: string): Uint8Array {
 }
 
 function uint8ArrayToString(fileData: Uint8Array) {
-    const encodedString = String.fromCharCode.apply(null, Array.from(fileData));
+    const chunkSize = 0x8000
+    const parts: string[] = []
+    for (let offset = 0; offset < fileData.length; offset += chunkSize) {
+        const chunk = fileData.subarray(offset, offset + chunkSize)
+        parts.push(String.fromCharCode(...Array.from(chunk)))
+    }
+    const encodedString = parts.join('')
     const decodedString = decodeURIComponent(escape(encodedString));
     return decodedString
 }

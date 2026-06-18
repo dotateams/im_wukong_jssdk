@@ -150,12 +150,12 @@ export class SecurityManager {
     }
 
     public encryption2(message: Uint8Array) {
-        const encodedString = String.fromCharCode.apply(null, Array.from(message));
+        const encodedString = uint8ArrayToString(message);
         const decodedString = decodeURIComponent(escape(encodedString));
         return this.encryption(decodedString)
     }
     public uintToString(array: any[]): string {
-        const encodedString = String.fromCharCode.apply(null, array);
+        const encodedString = uint8ArrayToString(new Uint8Array(array));
         // const decodedString = decodeURIComponent(escape(encodedString));
         return encodedString;
     }
