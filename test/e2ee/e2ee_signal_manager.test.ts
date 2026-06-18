@@ -82,7 +82,7 @@ test("signal protocol manager returns keyId fields for session bundle building",
     assert.equal(bundle.prekey.keyID, undefined);
 });
 
-test("group manager retries inline sender-key distribution for early messages", async () => {
+test("group manager uploads sender-key envelopes for early messages without inline distribution", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
     manager.deviceId = "alice-web";
@@ -105,6 +105,7 @@ test("group manager retries inline sender-key distribution for early messages", 
         ],
     });
 
+    let uploads = 0;
     manager.parent = {
         encryptGroupPayload: async (_messageKey: string, msgIndex: number) => ({
             iv: `iv-${msgIndex}`,
@@ -114,11 +115,15 @@ test("group manager retries inline sender-key distribution for early messages", 
             enc: "aes-256-gcm",
         }),
         signGroupPayload: async () => "signature",
+        uploadGroupSenderKeyEnvelopes: async () => {
+            uploads++;
+        },
     };
     manager.normalizeMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => record;
     manager.saveSenderKeyRecord = async () => undefined;
     manager.buildDistributionPayloadForRecord = async () => ({
+        key_id: 9,
         distribution: { type: "signal_multi", ciphertexts: [{ uid: "bob", device_id: "bob-web", body: "key" }] },
         member_hash: "members-v2",
         kdf_ver: "v2",
@@ -132,16 +137,17 @@ test("group manager retries inline sender-key distribution for early messages", 
     }
 
     assert.equal(bodies[0].msg_index, 0);
-    assert.ok(bodies[0].distribution);
+    assert.equal(bodies[0].distribution, undefined);
     assert.equal(bodies[1].msg_index, 1);
-    assert.ok(bodies[1].distribution);
+    assert.equal(bodies[1].distribution, undefined);
     assert.equal(bodies[2].msg_index, 2);
-    assert.ok(bodies[2].distribution);
+    assert.equal(bodies[2].distribution, undefined);
     assert.equal(bodies[3].msg_index, 3);
     assert.equal(bodies[3].distribution, undefined);
+    assert.equal(uploads, 1);
 });
 
-test("group manager periodically redistributes sender key for unchanged members", async () => {
+test("group manager periodically uploads sender-key envelopes for unchanged members without inline distribution", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
     manager.deviceId = "alice-web";
@@ -165,6 +171,7 @@ test("group manager periodically redistributes sender key for unchanged members"
         ],
     });
 
+    let uploads = 0;
     manager.parent = {
         encryptGroupPayload: async (_messageKey: string, msgIndex: number) => ({
             iv: `iv-${msgIndex}`,
@@ -174,6 +181,9 @@ test("group manager periodically redistributes sender key for unchanged members"
             enc: "aes-256-gcm",
         }),
         signGroupPayload: async () => "signature",
+        uploadGroupSenderKeyEnvelopes: async () => {
+            uploads++;
+        },
     };
     manager.normalizeMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => record;
@@ -191,10 +201,11 @@ test("group manager periodically redistributes sender key for unchanged members"
     assert.equal(periodic.msg_index, 19);
     assert.equal(periodic.distribution, undefined);
     assert.equal(nonPeriodic.msg_index, 20);
-    assert.ok(nonPeriodic.distribution);
+    assert.equal(nonPeriodic.distribution, undefined);
+    assert.equal(uploads, 1);
 });
 
-test("group manager uploads sender key envelopes when inline distribution is attached", async () => {
+test("group manager uploads sender key envelopes without attaching inline distribution", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
     manager.deviceId = "alice-web";
@@ -242,8 +253,11 @@ test("group manager uploads sender key envelopes when inline distribution is att
         kdf_ver: "v2",
     });
 
-    await manager.encryptGroupMessage("group-1", "hello", [{ uid: "bob", devices: ["bob-web"] }], "members-v2");
+    const encrypted = await manager.encryptGroupMessage("group-1", "hello", [{ uid: "bob", devices: ["bob-web"] }], "members-v2");
+    const body = JSON.parse(encrypted.body);
 
+    assert.equal(body.distribution, undefined);
+    assert.equal(body.member_hash, undefined);
     assert.ok(uploaded);
     assert.equal(uploaded.group_id, "group-1");
     assert.equal(uploaded.sender_uid, "alice");
@@ -313,7 +327,7 @@ test("group manager retries sender key envelope upload after a failed cached att
     };
 
     try {
-        await manager.uploadDistributionEnvelopes("group-1", distribution);
+        await assert.rejects(() => manager.uploadDistributionEnvelopes("group-1", distribution), /temporary database overload/);
         await manager.uploadDistributionEnvelopes("group-1", distribution);
     } finally {
         console.warn = originalWarn;

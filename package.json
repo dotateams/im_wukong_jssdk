@@ -1,6 +1,6 @@
 {
   "name": "wukongimjssdk",
-  "version": "1.2.12-e2ee.7",
+  "version": "1.2.12-e2ee.8",
   "wkE2EE": {
     "internalPackage": true,
     "publicBaseVersion": "1.2.11"

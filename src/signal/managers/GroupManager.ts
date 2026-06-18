@@ -253,9 +253,6 @@ export class GroupManager {
       if (shouldDistribute) {
         const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, normalizedMemberHash);
         if (distribution) {
-          payload.distribution = distribution.distribution;
-          payload.member_hash = distribution.member_hash;
-          payload.kdf_ver = distribution.kdf_ver;
           await this.uploadDistributionEnvelopes(groupId, distribution);
         }
       }
@@ -310,11 +307,7 @@ export class GroupManager {
     }
     const pendingUpload = uploadCacheKey ? this.senderKeyEnvelopeUploadPromises.get(uploadCacheKey) : undefined;
     if (pendingUpload) {
-      try {
-        await pendingUpload;
-      } catch (error) {
-        console.warn('[GroupManager] upload sender key envelopes failed', error);
-      }
+      await pendingUpload;
       return;
     }
     const doUpload = async () => {
@@ -337,6 +330,7 @@ export class GroupManager {
       await uploadPromise;
     } catch (error) {
       console.warn('[GroupManager] upload sender key envelopes failed', error);
+      throw error;
     } finally {
       if (uploadCacheKey) {
         this.senderKeyEnvelopeUploadPromises.delete(uploadCacheKey);
@@ -552,7 +546,19 @@ export class GroupManager {
     };
     await this.uploadDistributionEnvelopes(groupId, payload);
     await this.saveSenderKeyRecord(groupId, this.uid, record, this.deviceId);
-    return { type: 0, body: JSON.stringify(payload) };
+    return {
+      type: 0,
+      body: JSON.stringify({
+        type: payload.type,
+        group_id: payload.group_id,
+        sender_uid: payload.sender_uid,
+        sender_device_id: payload.sender_device_id,
+        key_id: payload.key_id,
+        version: payload.version,
+        member_hash: payload.member_hash,
+        kdf_ver: payload.kdf_ver,
+      }),
+    };
   }
 
   async decryptGroupMessageObject(obj: any, remoteUid: string, remoteDeviceId: any) {

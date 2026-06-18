@@ -39,7 +39,7 @@ test("concurrent duplicate sender-key envelope uploads are coalesced", async () 
   assert.equal(uploadCount, 1);
 });
 
-test("concurrent failed sender-key envelope upload waiters do not throw", async () => {
+test("concurrent failed sender-key envelope upload waiters reject without duplicate uploads", async () => {
   let uploadCount = 0;
   const parent = {
     uploadGroupSenderKeyEnvelopes: async () => {
@@ -62,13 +62,56 @@ test("concurrent failed sender-key envelope upload waiters do not throw", async 
   };
 
   try {
-    await Promise.all([
+    await assert.rejects(() => Promise.all([
       manager.uploadDistributionEnvelopes("g1", distribution),
       manager.uploadDistributionEnvelopes("g1", distribution),
-    ]);
+    ]), /temporary overload/);
   } finally {
     console.warn = originalWarn;
   }
 
   assert.equal(uploadCount, 1);
+});
+
+test("explicit group distribution upload returns compact payload without inline envelopes", async () => {
+  let uploaded: any = null;
+  const parent = {
+    encryptGroupDistributionForDevice: async (uid: string, plain: string, devices: string[]) => {
+      const targetDevices = Array.isArray(devices) && devices.length > 0 ? devices : ["web"];
+      return targetDevices.map((deviceId) => ({
+        uid,
+        device_id: deviceId,
+        enc: "aes-256-gcm",
+        body: `encrypted:${plain}:${deviceId}`,
+      }));
+    },
+    uploadGroupSenderKeyEnvelopes: async (payload: any) => {
+      uploaded = payload;
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  const record = {
+    getState: () => ({
+      keyId: 7,
+      senderKey: "sender-key",
+      signingPubKey: "signing-key",
+      kdfVersion: "v2",
+    }),
+  };
+  manager.loadSenderKeyRecord = async () => record;
+  manager.createSenderKeyRecord = async () => record;
+  manager.saveSenderKeyRecord = async () => undefined;
+  manager.normalizeMemberHash = () => "members-v1";
+
+  const encrypted = await manager.encryptGroupDistribution(
+    "g1",
+    [{ uid: "alice", devices: ["web", "app"] }],
+    "members-v1",
+    true,
+  );
+  const body = JSON.parse(encrypted.body);
+
+  assert.equal(body.type, "signal_group_distribution");
+  assert.equal(body.distribution, undefined);
+  assert.equal(uploaded.envelopes.length, 2);
 });
