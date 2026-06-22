@@ -89,6 +89,9 @@ export class E2EEMediaCrypto {
     }
 
     public async restoreContent(content: MessageEncryptedMedia): Promise<MessageContent> {
+        if (this.shouldDeferOriginal(content)) {
+            return this.restoreDeferredOriginal(content)
+        }
         const displayPart = content.thumb || content.original
         const displayBlob = await this.decryptPart(displayPart)
         const displayUrl = this.createObjectURL(displayBlob)
@@ -109,6 +112,35 @@ export class E2EEMediaCrypto {
             original: content.original,
             thumb: content.thumb,
             displayUrl,
+        }
+        return restored
+    }
+
+    private shouldDeferOriginal(content: MessageEncryptedMedia): boolean {
+        if (content.thumb) {
+            return false
+        }
+        const kind = (content.mediaKind || "").toLowerCase()
+        return kind === "media" || kind === "file" || kind === "video" || kind === "audio"
+    }
+
+    private restoreDeferredOriginal(content: MessageEncryptedMedia): MessageContent {
+        const restored = MessageContentManager.shared().getMessageContent(content.originalContentType)
+        const payload: any = {
+            type: content.originalContentType,
+            url: "",
+            width: content.original?.width || 0,
+            height: content.original?.height || 0,
+            name: content.name || "",
+            size: content.original?.size || 0,
+        }
+        restored.decode(this.stringToUint8Array(JSON.stringify(payload)))
+        ;(restored as any).e2eeMedia = {
+            version: content.version,
+            mediaKind: content.mediaKind,
+            originalContentType: content.originalContentType,
+            original: content.original,
+            thumb: content.thumb,
         }
         return restored
     }

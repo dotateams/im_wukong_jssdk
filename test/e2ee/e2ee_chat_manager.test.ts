@@ -18,6 +18,46 @@ import { E2EEMediaCrypto } from "../../src/e2ee/e2ee_media";
 
 declare const test: (name: string, fn: () => void | Promise<void>) => void;
 
+const TestFileContentType = 8;
+
+class TestFileContent extends MediaMessageContent {
+    public width: number = 0;
+    public height: number = 0;
+    public url: string = "";
+    public name: string = "";
+    public size: number = 0;
+
+    constructor(file?: File, name?: string, size?: number) {
+        super();
+        this.file = file;
+        this.name = name || (file && file.name) || "";
+        this.size = size !== undefined ? size : ((file && (file as any).size) || 0);
+    }
+
+    public get contentType(): number {
+        return TestFileContentType;
+    }
+
+    public decodeJSON(content: any) {
+        this.width = content.width || 0;
+        this.height = content.height || 0;
+        this.url = content.url || "";
+        this.remoteUrl = this.url;
+        this.name = content.name || "";
+        this.size = content.size || 0;
+    }
+
+    public encodeJSON() {
+        return {
+            width: this.width || 0,
+            height: this.height || 0,
+            url: this.remoteUrl || "",
+            name: this.name || "",
+            size: this.size || 0,
+        };
+    }
+}
+
 function resetSdk() {
     const sdk = WKSDK.shared();
     sdk.config.uid = "sender";
@@ -33,6 +73,8 @@ function resetSdk() {
     }
     return sdk;
 }
+
+WKSDK.shared().register(TestFileContentType, () => new TestFileContent());
 
 function cacheChannelInfo(channel: Channel, isE2e: boolean) {
     const sdk = WKSDK.shared();
@@ -547,6 +589,54 @@ test("e2ee_media unwraps server encrypted file responses before media decrypt", 
     } finally {
         (globalThis as any).fetch = oldFetch;
     }
+});
+
+test("e2ee_media restores file metadata without fetching original until download", async () => {
+    const channel = new Channel("receiver", ChannelTypePerson);
+    const mediaStore = new Map<string, Blob>();
+    let fetchCount = 0;
+    const provider = {
+        uploadEncryptedMedia: async (file: Blob, context: any) => {
+            const url = `file/preview/chat/e2ee-${context.kind}.bin`;
+            mediaStore.set(url, file);
+            return url;
+        },
+        fetchEncryptedMedia: async (url: string) => {
+            fetchCount++;
+            const blob = mediaStore.get(url);
+            if (!blob) {
+                throw new Error(`missing encrypted blob ${url}`);
+            }
+            return blob;
+        },
+        createThumbnail: async () => undefined,
+    };
+    const crypto = new E2EEMediaCrypto({ provider } as any);
+    const source = new TestFileContent(
+        testFile(["large file body"], "credentials.json", "application/json"),
+        "credentials.json",
+        15,
+    );
+
+    const encrypted = await crypto.encryptContent(source, channel);
+    assert.equal(encrypted.originalContentType, TestFileContentType);
+    assert.equal(encrypted.thumb, undefined);
+
+    const restored = await crypto.restoreContent(encrypted);
+    assert.equal(fetchCount, 0);
+    assert.equal(restored.contentType, TestFileContentType);
+    assert.equal((restored as TestFileContent).name, "credentials.json");
+    assert.equal((restored as TestFileContent).size, 15);
+    assert.equal((restored as TestFileContent).url, "");
+    assert.ok((restored as any).e2eeMedia.original);
+
+    const originalURL = await crypto.loadOriginal(restored);
+    assert.ok((originalURL || "").indexOf("blob:") === 0);
+    assert.equal(fetchCount, 1);
+
+    const cachedURL = await crypto.loadOriginal(restored);
+    assert.equal(cachedURL, originalURL);
+    assert.equal(fetchCount, 1);
 });
 
 test("e2ee_media default upload sends api auth headers", async () => {
