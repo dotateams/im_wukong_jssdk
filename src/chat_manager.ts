@@ -193,10 +193,9 @@ export class ChatManager {
                 message.content = await WKSDK.shared().config.e2ee.restoreCachedPlaintext(cachedContent)
                 ;(message as any).e2eeDecryptFailed = false
                 this.debugE2EEDecrypt("cache", message, message.content)
+                return
             } catch (error) {
                 this.removeE2EEPlaintextCacheKeys(message, signalContent)
-                ;(message as any).e2eeDecryptFailed = true
-                ;(message as any).e2eeDecryptError = error
                 this.debugE2EEDecryptFailure(message, cachedContent, error)
                 console.error("[E2EE] cached plaintext restore failed", {
                     channelID: message.channel && message.channel.channelID,
@@ -206,9 +205,7 @@ export class ChatManager {
                     messageID: message.messageID,
                     clientMsgNo: message.clientMsgNo,
                 }, error)
-                message.content = this.buildE2EEDecryptFailureContent(error)
             }
-            return
         }
         this.debugE2EEDecrypt("before", message, message.content)
         if (this.isRecentE2EEDecryptFailure(message, signalContent)) {

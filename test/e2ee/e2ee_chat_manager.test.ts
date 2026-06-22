@@ -345,19 +345,21 @@ test("e2ee_chat_manager restores self-sent encrypted media history from metadata
     }
 });
 
-test("e2ee_chat_manager downgrades invalid cached encrypted media without throwing", async () => {
+test("e2ee_chat_manager reports failure when invalid media cache and signal decrypt both fail", async () => {
     const localStore = installStorageMock("localStorage");
     installStorageMock("sessionStorage");
     const sdk = resetSdk();
     const channel = new Channel("receiver", ChannelTypePerson);
     cacheChannelInfo(channel, true);
+    let decryptCalled = false;
 
     await sdk.config.initE2EE({
         uid: "sender",
         deviceId: "web-device-1",
         cryptoAdapter: {
             decryptMessage: async () => {
-                throw new Error("invalid cached media should not fall through to decrypt");
+                decryptCalled = true;
+                throw new Error("fallback signal decrypt failed");
             },
         },
     });
@@ -386,8 +388,74 @@ test("e2ee_chat_manager downgrades invalid cached encrypted media without throwi
 
     await sdk.chatManager.decryptMessageIfNeeded(message);
 
+    assert.equal(decryptCalled, true);
     assert.equal((message as any).e2eeDecryptFailed, true);
     assert.equal(message.content.contentType, MessageContentType.text);
+    assert.equal(localStore.has(cacheKey), false);
+});
+
+test("e2ee_chat_manager falls back to signal decrypt when cached encrypted media is invalid", async () => {
+    const localStore = installStorageMock("localStorage");
+    installStorageMock("sessionStorage");
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+    let decryptCalled = false;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: installMediaProvider(mediaStore),
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                const signal = signalContent("signal_multi");
+                signal.realContentType = MessageContentType.encryptedMedia;
+                return signal;
+            },
+            decryptMessage: async () => {
+                decryptCalled = true;
+                return encryptedMediaPayload!;
+            },
+        },
+    });
+
+    await sdk.chatManager.prepareContentForSend(
+        new MessageImage(testFile(["hello image"], "hello.png", "image/png"), 640, 480),
+        channel,
+    );
+    assert.ok(encryptedMediaPayload);
+
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "receiver";
+    message.clientMsgNo = "bad-media-cache-fallback";
+    message.content = signalContent("signal_multi");
+    (message.content as MessageSignalContent).realContentType = MessageContentType.encryptedMedia;
+
+    const cacheKey = (sdk.chatManager as any).e2eePlaintextCacheKeys(message, message.content)[0];
+    localStore.set(cacheKey, JSON.stringify({
+        type: MessageContentType.encryptedMedia,
+        payload: {
+            version: 1,
+            media_kind: "image",
+            original_content_type: MessageContentType.image,
+            original: {
+                url: "file/preview/chat/bad.e2ee",
+            },
+        },
+        cachedAt: Date.now(),
+        expiresAt: Date.now() + 60000,
+    }));
+
+    await sdk.chatManager.decryptMessageIfNeeded(message);
+
+    assert.equal(decryptCalled, true);
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.equal(message.content.contentType, MessageContentType.image);
+    assert.ok(((message.content as any).url || "").indexOf("blob:") === 0);
     assert.equal(localStore.has(cacheKey), false);
 });
 
