@@ -631,7 +631,24 @@ export class GroupManager {
       throw new Error('Missing sender key');
     }
     const cipher = new GroupCipher(this.parent, record, groupId, senderUid);
-    const plaintext = await cipher.decrypt(obj);
+    let plaintext: any;
+    try {
+      plaintext = await cipher.decrypt(obj);
+    } catch (error) {
+      if (!this.isMissingMessageKeyError(error)) {
+        throw error;
+      }
+      const recovered = await this.recoverSenderKeyFromEnvelope(obj, senderUid, senderDeviceId);
+      if (!recovered) {
+        throw error;
+      }
+      record = await this.loadSenderKeyRecord(groupId, senderUid, senderDeviceId);
+      if (!record) {
+        throw error;
+      }
+      const retryCipher = new GroupCipher(this.parent, record, groupId, senderUid);
+      plaintext = await retryCipher.decrypt(obj);
+    }
     this.saveSenderKeyRecord(groupId, senderUid, record, senderDeviceId);
     return plaintext;
   }
@@ -735,6 +752,10 @@ export class GroupManager {
   private isPermanentEnvelopeLookupError(error: any): boolean {
     const status = Number(error?.status ?? error?.code ?? error?.response?.status ?? 0);
     return status === 403 || status === 404;
+  }
+
+  private isMissingMessageKeyError(error: any): boolean {
+    return String(error?.message || error || '').indexOf('Missing message key') >= 0;
   }
 
   private delay(ms: number): Promise<void> {

@@ -870,6 +870,66 @@ test("e2ee_chat_manager decrypts synced history messages before returning them",
     }
 });
 
+test("e2ee_chat_manager decrypts synced group history by message sequence without reordering result", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const newer = new Message();
+    newer.messageID = "group-msg-2";
+    newer.clientMsgNo = "group-client-2";
+    newer.messageSeq = 2;
+    newer.channel = channel;
+    newer.fromUID = "alice";
+    newer.content = signalContent("signal_group");
+    newer.content.ciphertext = JSON.stringify({ msg_index: 1 });
+
+    const older = new Message();
+    older.messageID = "group-msg-1";
+    older.clientMsgNo = "group-client-1";
+    older.messageSeq = 1;
+    older.channel = channel;
+    older.fromUID = "alice";
+    older.content = signalContent("signal_group");
+    older.content.ciphertext = JSON.stringify({ msg_index: 0 });
+
+    let nextIndex = 0;
+    const decryptOrder: number[] = [];
+    sdk.config.provider.syncMessagesCallback = async () => [newer, older];
+    await sdk.config.initE2EE({
+        uid: "bob",
+        deviceId: "bob-web",
+        cryptoAdapter: {
+            decryptMessage: async (content) => {
+                const index = JSON.parse((content as MessageSignalContent).ciphertext).msg_index;
+                decryptOrder.push(index);
+                if (index < nextIndex) {
+                    throw new Error("Missing message key");
+                }
+                nextIndex = index + 1;
+                return new MessageText(`history ${index}`);
+            },
+        },
+    });
+
+    try {
+        const messages = await sdk.chatManager.syncMessages(channel, {
+            limit: 15,
+            startMessageSeq: 0,
+            endMessageSeq: 0,
+            pullMode: 0,
+        } as any);
+
+        assert.strictEqual(messages[0], newer);
+        assert.strictEqual(messages[1], older);
+        assert.deepEqual(decryptOrder, [0, 1]);
+        assert.equal((older.content as MessageText).text, "history 0");
+        assert.equal((newer.content as MessageText).text, "history 1");
+        assert.equal((older as any).e2eeDecryptFailed, false);
+        assert.equal((newer as any).e2eeDecryptFailed, false);
+    } finally {
+        sdk.config.provider.syncMessagesCallback = undefined;
+    }
+});
+
 test("e2ee_chat_manager logs signal content before and after debug decrypt", async () => {
     const sdk = resetSdk();
     const channel = new Channel("receiver", ChannelTypePerson);

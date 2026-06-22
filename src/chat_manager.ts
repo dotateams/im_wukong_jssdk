@@ -88,7 +88,7 @@ export class ChatManager {
         }
         const messages = await WKSDK.shared().config.provider.syncMessagesCallback!(channel, opts)
         if (messages && messages.length > 0) {
-            for (const message of messages) {
+            for (const message of this.messagesForE2EEDecryption(messages)) {
                 await this.decryptMessageIfNeeded(message)
             }
         }
@@ -240,6 +240,26 @@ export class ChatManager {
             }
             message.content = this.buildE2EEDecryptFailureContent(error)
         }
+    }
+
+    private messagesForE2EEDecryption(messages: Message[]): Message[] {
+        return messages
+            .map((message, index) => ({ message, index, seq: this.normalizedMessageSeq(message) }))
+            .sort((a, b) => {
+                if (a.seq !== undefined && b.seq !== undefined && a.seq !== b.seq) {
+                    return a.seq - b.seq
+                }
+                return a.index - b.index
+            })
+            .map((item) => item.message)
+    }
+
+    private normalizedMessageSeq(message: Message): number | undefined {
+        const seq = Number(message && message.messageSeq)
+        if (!Number.isFinite(seq) || seq <= 0) {
+            return undefined
+        }
+        return seq
     }
 
     buildE2EEDecryptFailureContent(error: any): MessageText {

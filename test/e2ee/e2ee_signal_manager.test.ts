@@ -463,6 +463,74 @@ test("group manager recovers sender key envelope when local record misses messag
     assert.ok(saved && saved.getStateByKeyId(8));
 });
 
+test("group manager recovers sender key envelope when local state is past message index", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-web";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+
+    const distributionPlain = new SenderKeyDistributionMessage({
+        groupId: "group-1",
+        senderUid: "alice",
+        senderDeviceId: "alice-web",
+        keyId: 9,
+        senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        signingPubKey: "pub-9",
+        memberHash: "members-v3",
+        kdfVersion: "v2",
+    }).toString();
+
+    let saved: SenderKeyRecord | null = new SenderKeyRecord({
+        memberHash: "members-v3",
+        states: [
+            new SenderKeyState({
+                keyId: 9,
+                senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                chainKey: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+                signingPubKey: "pub-9",
+                signingPrivKey: "priv-9",
+                messageIndex: 2,
+                skipped: {},
+                kdfVersion: "v2",
+            }),
+        ],
+    });
+    let lookups = 0;
+    manager.loadSenderKeyRecord = async () => saved;
+    manager.saveSenderKeyRecord = async (_groupId: string, _senderUid: string, record: SenderKeyRecord) => {
+        saved = record;
+    };
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => {
+            lookups++;
+            return { envelope: JSON.stringify({ uid: "bob", device_id: "bob-web", body: "server-envelope", is_ecies: true }) };
+        },
+        decryptGroupDistributionForDevice: async () => distributionPlain,
+        verifyGroupSignature: async () => true,
+        decryptGroupPayload: async () => JSON.stringify({ type: 1, content: "old history message" }),
+    };
+
+    const plaintext = await manager.decryptGroupMessageObject({
+        type: "signal_group",
+        group_id: "group-1",
+        sender_uid: "alice",
+        sender_device_id: "alice-web",
+        key_id: 9,
+        msg_index: 0,
+        iv: "iv",
+        body: "body",
+        mac: "mac",
+        tag: "tag",
+        enc: "aes-256-gcm",
+        signature: "sig",
+    }, "alice", "alice-web");
+
+    assert.equal(plaintext, JSON.stringify({ type: 1, content: "old history message" }));
+    assert.equal(lookups, 1);
+    assert.ok(saved && saved.getStateByKeyId(9));
+    assert.equal(saved && saved.getStateByKeyId(9)?.messageIndex, 1);
+});
+
 test("group manager retries transient sender key envelope lookup failure", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "bob";
