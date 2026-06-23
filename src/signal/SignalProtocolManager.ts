@@ -425,7 +425,7 @@ export class SignalProtocolManager {
     return matched
   }
 
-  async encryptGroupDistributionForDevice(recipientUid: string, distributionPlain: string) {
+  async encryptGroupDistributionForDevice(recipientUid: string, distributionPlain: string, devices?: any[]) {
     if (!recipientUid) {
       throw new Error("Missing recipient")
     }
@@ -434,11 +434,10 @@ export class SignalProtocolManager {
     if (!subtle) {
       throw new Error("Missing AES-GCM support")
     }
-    const resp = await this.keyBundleDirectory.getUserKeyBundles(recipientUid, true)
-    console.log("[SignalProtocolManager] encryptGroupDistributionForDevice bundles", {
-      recipientUid,
-      count: Array.isArray(resp) ? resp.length : -1,
-    })
+    let resp = this.normalizeProvidedKeyBundles(recipientUid, devices)
+    if (resp.length === 0) {
+      resp = await this.keyBundleDirectory.getUserKeyBundles(recipientUid)
+    }
     if (!resp || resp.length === 0) {
       console.warn("[SignalProtocolManager] encryptGroupDistributionForDevice no key bundles", {
         recipientUid,
@@ -480,6 +479,23 @@ export class SignalProtocolManager {
       })
     }
     return ciphertexts
+  }
+
+  normalizeProvidedKeyBundles(recipientUid: string, devices?: any[]) {
+    if (!Array.isArray(devices) || devices.length === 0) {
+      return []
+    }
+    const bundles: any[] = []
+    for (const device of devices) {
+      const raw = device && typeof device === "object"
+        ? { uid: recipientUid, ...device }
+        : { uid: recipientUid, device_id: device }
+      const normalized = this.keyBundleDirectory.normalize(raw)
+      if (normalized) {
+        bundles.push(normalized)
+      }
+    }
+    return bundles
   }
   async encryptGroupDistributionForDeviceIdentity(recipientUid: string, recipientDeviceId: string, identityKey: string, distributionPlain: string) {
     if (!recipientUid) {

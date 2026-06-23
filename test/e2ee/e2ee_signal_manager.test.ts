@@ -82,6 +82,42 @@ test("signal protocol manager returns keyId fields for session bundle building",
     assert.equal(bundle.prekey.keyID, undefined);
 });
 
+test("signal protocol manager encrypts group distribution from provided device bundles without fetching user keys", async () => {
+    const manager: any = new SignalProtocolManager("alice", {
+        get: async (path: string) => {
+            throw new Error(`unexpected key bundle fetch: ${path}`);
+        },
+    }, {
+        deviceId: "alice-web",
+    });
+    manager.ensureWebCrypto = () => undefined;
+    manager.getSubtleCrypto = () => ({
+        importKey: async () => ({}),
+        encrypt: async () => {
+            const bytes = new Uint8Array(20);
+            bytes.set([1, 2, 3, 4]);
+            return bytes.buffer;
+        },
+    });
+    manager.getCurve = async () => ({
+        generateKeyPair: () => ({ pubKey: new Uint8Array([1, 2, 3]), privKey: new Uint8Array([4, 5, 6]) }),
+        calculateAgreement: () => new Uint8Array([7, 8, 9]),
+    });
+    manager.hkdfSha256Bytes = () => new Uint8Array(32);
+    manager.randomBytes = () => new Uint8Array(12);
+    manager.stringToArrayBuffer = (value: string) => new TextEncoder().encode(value).buffer;
+
+    const ciphertexts = await manager.encryptGroupDistributionForDevice("bob", "distribution", [{
+        uid: "bob",
+        device_id: "bob-web",
+        identity_key: "AQIDBA==",
+    }]);
+
+    assert.equal(ciphertexts.length, 1);
+    assert.equal(ciphertexts[0].uid, "bob");
+    assert.equal(ciphertexts[0].device_id, "bob-web");
+});
+
 test("group manager uploads sender-key envelopes for early messages without inline distribution", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
