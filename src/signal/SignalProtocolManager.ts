@@ -436,7 +436,7 @@ export class SignalProtocolManager {
     }
     let resp = this.normalizeProvidedKeyBundles(recipientUid, devices)
     if (resp.length === 0) {
-      resp = await this.keyBundleDirectory.getUserKeyBundles(recipientUid)
+      resp = await this.keyBundleDirectory.getUserKeyBundles(recipientUid, true)
     }
     if (!resp || resp.length === 0) {
       console.warn("[SignalProtocolManager] encryptGroupDistributionForDevice no key bundles", {

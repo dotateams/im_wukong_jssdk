@@ -118,6 +118,90 @@ test("signal protocol manager encrypts group distribution from provided device b
     assert.equal(ciphertexts[0].device_id, "bob-web");
 });
 
+test("signal protocol manager encrypts large group distribution from provided bundles without key fetch fanout", async () => {
+    let keyFetches = 0;
+    const manager: any = new SignalProtocolManager("alice", {
+        get: async (path: string) => {
+            keyFetches++;
+            throw new Error(`unexpected key bundle fetch: ${path}`);
+        },
+    }, {
+        deviceId: "alice-web",
+    });
+    manager.ensureWebCrypto = () => undefined;
+    manager.getSubtleCrypto = () => ({
+        importKey: async () => ({}),
+        encrypt: async () => {
+            const bytes = new Uint8Array(20);
+            bytes.set([1, 2, 3, 4]);
+            return bytes.buffer;
+        },
+    });
+    manager.getCurve = async () => ({
+        generateKeyPair: () => ({ pubKey: new Uint8Array([1, 2, 3]), privKey: new Uint8Array([4, 5, 6]) }),
+        calculateAgreement: () => new Uint8Array([7, 8, 9]),
+    });
+    manager.hkdfSha256Bytes = () => new Uint8Array(32);
+    manager.randomBytes = () => new Uint8Array(12);
+    manager.stringToArrayBuffer = (value: string) => new TextEncoder().encode(value).buffer;
+
+    const devices = Array.from({ length: 1200 }, (_item, index) => ({
+        uid: "bob",
+        device_id: `bob-web-${index}`,
+        identity_key: "AQIDBA==",
+    }));
+    const started = Date.now();
+
+    const ciphertexts = await manager.encryptGroupDistributionForDevice("bob", "distribution", devices);
+
+    assert.equal(keyFetches, 0);
+    assert.equal(ciphertexts.length, 1200);
+    assert.equal(ciphertexts[1199].device_id, "bob-web-1199");
+    assert.ok(Date.now() - started < 2000, "large provided-bundle distribution path should stay local and fast");
+});
+
+test("signal protocol manager force refreshes key bundles when provided devices are incomplete", async () => {
+    let forceRefreshArg: boolean | undefined;
+    const manager: any = Object.create(SignalProtocolManager.prototype);
+    manager.keyBundleDirectory = {
+        normalize: () => null,
+        getUserKeyBundles: async (_uid: string, forceRefresh?: boolean) => {
+            forceRefreshArg = forceRefresh;
+            return [{
+                uid: "bob",
+                deviceId: "bob-web",
+                identityKey: "AQIDBA==",
+            }];
+        },
+    };
+    manager.ensureWebCrypto = () => undefined;
+    manager.getSubtleCrypto = () => ({
+        importKey: async () => ({}),
+        encrypt: async () => {
+            const bytes = new Uint8Array(20);
+            bytes.set([1, 2, 3, 4]);
+            return bytes.buffer;
+        },
+    });
+    manager.getCurve = async () => ({
+        generateKeyPair: () => ({ pubKey: new Uint8Array([1, 2, 3]), privKey: new Uint8Array([4, 5, 6]) }),
+        calculateAgreement: () => new Uint8Array([7, 8, 9]),
+    });
+    manager.fromBase64 = (value: string) => Buffer.from(value, "base64");
+    manager.toBase64 = (value: Uint8Array) => Buffer.from(value).toString("base64");
+    manager.hkdfSha256Bytes = () => new Uint8Array(32);
+    manager.randomBytes = () => new Uint8Array(12);
+    manager.stringToArrayBuffer = (value: string) => new TextEncoder().encode(value).buffer;
+
+    const ciphertexts = await manager.encryptGroupDistributionForDevice("bob", "distribution", [{
+        device_id: "bob-web",
+    }]);
+
+    assert.equal(forceRefreshArg, true);
+    assert.equal(ciphertexts.length, 1);
+    assert.equal(ciphertexts[0].device_id, "bob-web");
+});
+
 test("group manager uploads sender-key envelopes for early messages without inline distribution", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
