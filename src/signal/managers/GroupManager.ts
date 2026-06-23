@@ -396,7 +396,7 @@ export class GroupManager {
     const distributionPlain = distributionMessage.toString();
     const ciphertexts: any[] = [];
     for (const member of members) {
-      if (!member || !member.uid || member.uid === this.uid) {
+      if (!member || !member.uid) {
         continue;
       }
       try {
@@ -492,7 +492,7 @@ export class GroupManager {
     const distributionPlain = distributionMessage.toString();
     const ciphertexts: any[] = [];
     for (const member of members) {
-      if (!member || !member.uid || member.uid === this.uid) {
+      if (!member || !member.uid) {
         continue;
       }
       // const deviceIds = Array.isArray(member.deviceIds) ? member.deviceIds : []

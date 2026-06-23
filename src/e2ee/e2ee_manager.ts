@@ -1,5 +1,5 @@
 import type { Channel, ChannelInfo, MediaMessageContent, MessageContent } from "../model";
-import { ChannelTypePerson } from "../model";
+import { ChannelTypeGroup, ChannelTypePerson } from "../model";
 import type { E2EEDecryptContext, E2EEInitOptions, E2EESendPlan, ResolveSendPlanOptions } from "./e2ee_types";
 import { SignalE2EEAdapter } from "./e2ee_signal_adapter";
 import { SignalProtocolManager } from "../signal/SignalProtocolManager";
@@ -83,6 +83,16 @@ export class E2EEManager {
             throw new Error("E2EE encrypt adapter is unavailable");
         }
         return adapter.encryptMessage(content, channel);
+    }
+
+    public async prewarmChannel(channel: Channel): Promise<void> {
+        if (!this.options || channel.channelType !== ChannelTypeGroup) {
+            return;
+        }
+        const adapter: any = this.options.cryptoAdapter as any;
+        if (adapter && typeof adapter.prewarmChannel === "function") {
+            await adapter.prewarmChannel(channel);
+        }
     }
 
     public canEncryptMedia(content: MessageContent): boolean {
@@ -225,7 +235,7 @@ export class E2EEManager {
                 localDeviceId: options.deviceId,
                 signalManager,
                 getGroupMembers: async (groupId: string) =>
-                    signalManager.getChanelSubscribersDevices(groupId, 2, true),
+                    signalManager.getChanelSubscribersDevices(groupId, 2),
                 getGroupMemberHash: (_groupId: string, members: any[]) =>
                     signalManager.normalizeMemberHash(undefined, members),
             }),

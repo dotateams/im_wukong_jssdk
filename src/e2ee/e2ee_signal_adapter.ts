@@ -46,6 +46,13 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         this.getGroupMemberHash = options.getGroupMemberHash;
     }
 
+    public async prewarmChannel(channel: Channel): Promise<void> {
+        if (channel.channelType !== ChannelTypeGroup || !this.getGroupMembers) {
+            return;
+        }
+        await this.getGroupMembers(channel.channelID);
+    }
+
     public async encryptMessage(content: MessageContent, channel: Channel): Promise<MessageContent> {
         if (this.isSignalContent(content)) {
             return content;

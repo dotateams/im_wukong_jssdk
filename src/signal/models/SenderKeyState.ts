@@ -87,7 +87,7 @@ export class SenderKeyState {
     if (targetIndex < index) {
       const cached = skipped[targetIndex]
       if (!cached) {
-        throw new Error("Missing message key")
+        return { messageKey: this.deriveHistoricalMessageKey(targetIndex) }
       }
       delete skipped[targetIndex]
       this.skipped = skipped
@@ -107,6 +107,20 @@ export class SenderKeyState {
     this.messageIndex = targetIndex + 1
     this.skipped = skipped
     return { messageKey }
+  }
+
+  deriveHistoricalMessageKey(targetIndex: number) {
+    let chainKey = this.senderKey
+    let messageKey: any = null
+    for (let i = 0; i <= targetIndex; i++) {
+      const derived = this.deriveMessageKey(chainKey)
+      messageKey = derived.messageKey
+      chainKey = derived.nextChainKey
+    }
+    if (!messageKey) {
+      throw new Error("Missing message key")
+    }
+    return messageKey
   }
 
   deriveMessageKey(chainKeyBase64: string) {

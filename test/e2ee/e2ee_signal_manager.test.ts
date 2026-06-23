@@ -270,6 +270,84 @@ test("group manager uploads sender key envelopes without attaching inline distri
     }]);
 });
 
+test("group manager includes sender own devices in sender-key envelopes for history recovery", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+
+    const record = new SenderKeyRecord({
+        memberHash: "members-v2",
+        states: [
+            new SenderKeyState({
+                keyId: 9,
+                senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                chainKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                signingPubKey: "pub",
+                signingPrivKey: "priv",
+                messageIndex: 10,
+                skipped: {},
+                kdfVersion: "v2",
+            }),
+        ],
+    });
+    const encryptedFor: string[] = [];
+    manager.parent = {
+        encryptGroupDistributionForDevice: async (uid: string, _plain: string, devices: any[]) => {
+            return devices.map((device) => {
+                const deviceId = device.device_id || device.deviceId || device.id || device;
+                encryptedFor.push(`${uid}:${deviceId}`);
+                return {
+                    enc: "aes-256-gcm",
+                    uid,
+                    device_id: deviceId,
+                    body: `key:${uid}:${deviceId}`,
+                };
+            });
+        },
+    };
+
+    const distribution = await manager.buildDistributionPayloadForRecord("group-1", record, [
+        { uid: "alice", devices: [{ device_id: "alice-web" }, { device_id: "alice-phone" }] },
+        { uid: "bob", devices: [{ device_id: "bob-web" }] },
+    ], "members-v2");
+
+    assert.deepEqual(encryptedFor.sort(), ["alice:alice-phone", "alice:alice-web", "bob:bob-web"]);
+    assert.deepEqual(
+        distribution.distribution.ciphertexts.map((item: any) => `${item.uid}:${item.device_id}`).sort(),
+        ["alice:alice-phone", "alice:alice-web", "bob:bob-web"],
+    );
+});
+
+test("sender key state rederives old message key when skipped cache was trimmed", () => {
+    const rootKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const fresh = new SenderKeyState({
+        keyId: 9,
+        senderKey: rootKey,
+        chainKey: rootKey,
+        signingPubKey: "pub",
+        signingPrivKey: "priv",
+        messageIndex: 0,
+        skipped: {},
+        kdfVersion: "v2",
+    });
+    const expected = fresh.getMessageKeyForIndex(3).messageKey;
+    const advanced = new SenderKeyState({
+        keyId: 9,
+        senderKey: rootKey,
+        chainKey: rootKey,
+        signingPubKey: "pub",
+        signingPrivKey: "priv",
+        messageIndex: 0,
+        skipped: {},
+        kdfVersion: "v2",
+    });
+    advanced.getMessageKeyForIndex(80);
+    advanced.skipped = {};
+
+    assert.equal(advanced.getMessageKeyForIndex(3).messageKey, expected);
+    assert.equal(advanced.messageIndex, 81);
+});
+
 test("group manager skips duplicate sender key envelope uploads for same key and member hash", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
@@ -463,7 +541,7 @@ test("group manager recovers sender key envelope when local record misses messag
     assert.ok(saved && saved.getStateByKeyId(8));
 });
 
-test("group manager recovers sender key envelope when local state is past message index", async () => {
+test("group manager rederives old sender key locally when local state is past message index", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "bob";
     manager.deviceId = "bob-web";
@@ -526,9 +604,9 @@ test("group manager recovers sender key envelope when local state is past messag
     }, "alice", "alice-web");
 
     assert.equal(plaintext, JSON.stringify({ type: 1, content: "old history message" }));
-    assert.equal(lookups, 1);
+    assert.equal(lookups, 0);
     assert.ok(saved && saved.getStateByKeyId(9));
-    assert.equal(saved && saved.getStateByKeyId(9)?.messageIndex, 1);
+    assert.equal(saved && saved.getStateByKeyId(9)?.messageIndex, 2);
 });
 
 test("group manager retries transient sender key envelope lookup failure", async () => {
