@@ -34,6 +34,7 @@ export interface E2EEDecryptContext {
 export interface E2EECryptoAdapter {
     encryptMessage?: (content: MessageContent, channel: Channel) => Promise<MessageContent>;
     decryptMessage?: (content: MessageContent, channel: Channel, context?: E2EEDecryptContext) => Promise<MessageContent>;
+    prepareGroupSend?: (channel: Channel) => Promise<void>;
     clearLocalData?: () => Promise<void>;
 }
 
@@ -46,6 +47,7 @@ export interface E2EEInitOptions {
     cryptoAdapter?: E2EECryptoAdapter;
     mediaProvider?: E2EEMediaProvider;
     autoCreateSignalAdapter?: boolean;
+    senderKeyEnvelopeConcurrency?: number;
 }
 
 export interface ResolveSendPlanOptions {

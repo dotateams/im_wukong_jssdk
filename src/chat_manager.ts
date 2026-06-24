@@ -228,14 +228,21 @@ export class ChatManager {
             this.debugE2EEDecryptFailure(message, message.content, error)
             const shouldLog = this.markE2EEDecryptFailureIfNeeded(message, message.content, error)
             if (shouldLog) {
-                console.error("[E2EE] decrypt failed", {
+                const detail = {
                     channelID: message.channel && message.channel.channelID,
                     channelType: message.channel && message.channel.channelType,
                     fromUID: message.fromUID,
                     senderDeviceId: message.content.senderDeviceId,
                     messageID: message.messageID,
                     clientMsgNo: message.clientMsgNo,
-                }, error)
+                }
+                if (this.isMissingSenderKeyError(error)) {
+                    if (WKSDK.shared().config.debug) {
+                        console.warn("[E2EE] decrypt missing sender key", detail, error)
+                    }
+                } else {
+                    console.error("[E2EE] decrypt failed", detail, error)
+                }
             }
             message.content = this.buildE2EEDecryptFailureContent(error)
         }

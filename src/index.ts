@@ -141,6 +141,7 @@ export * from "./channel_manager"
 export * from "./provider"
 export * from "./e2ee"
 export { SignalProtocolManager } from "./signal/SignalProtocolManager"
+export { E2EEConfigManager } from "./signal/E2EEConfig"
 
 // const self = WKSDK.shared();
 // window['wksdk'] = self;  /* tslint:disable-line */ // 这样普通的JS就可以通过window.wksdk获取到app对象

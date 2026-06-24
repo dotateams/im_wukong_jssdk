@@ -15,6 +15,7 @@ export interface SignalLikeManager {
     encryptMessage(uid: string, deviceId: string | number, plaintext: string): Promise<any>;
     decryptMessage(uid: string, deviceId: string | number, messageType: any, ciphertext: any): Promise<string>;
     encryptGroupMessage?(groupId: string, plaintext: string, members?: any, memberHash?: any): Promise<any>;
+    prepareGroupSend?(groupId: string, members?: any, memberHash?: any): Promise<any>;
 }
 
 export interface SignalE2EEAdapterOptions {
@@ -31,6 +32,8 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
     private signalManager: SignalLikeManager;
     private getGroupMembers?: (groupId: string) => Promise<any[]>;
     private getGroupMemberHash?: (groupId: string, members: any[]) => string | Promise<string>;
+    private groupMembersCache: Map<string, { members: any[]; memberHash?: string }> = new Map();
+    private groupMembersPromises: Map<string, Promise<{ members: any[]; memberHash?: string }>> = new Map();
 
     constructor(options: SignalE2EEAdapterOptions) {
         if (!options.localDeviceId) {
@@ -50,7 +53,20 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         if (channel.channelType !== ChannelTypeGroup || !this.getGroupMembers) {
             return;
         }
-        await this.getGroupMembers(channel.channelID);
+        await this.getGroupMembersForEncrypt(channel.channelID);
+    }
+
+    public async prepareGroupSend(channel: Channel): Promise<void> {
+        if (channel.channelType !== ChannelTypeGroup || !this.signalManager.prepareGroupSend) {
+            return;
+        }
+        const group = await this.getGroupMembersForEncrypt(channel.channelID);
+        await this.signalManager.prepareGroupSend(channel.channelID, group.members, group.memberHash);
+    }
+
+    public invalidateGroupMemberCache(groupId: string): void {
+        this.groupMembersCache.delete(groupId);
+        this.groupMembersPromises.delete(groupId);
     }
 
     public async clearLocalData(): Promise<void> {
@@ -185,9 +201,8 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         if (!this.signalManager.encryptGroupMessage) {
             throw new Error("E2EE group encrypt adapter is unavailable");
         }
-        const members = this.getGroupMembers ? await this.getGroupMembers(groupId) : undefined;
-        const memberHash = this.getGroupMemberHash && members ? await this.getGroupMemberHash(groupId, members) : undefined;
-        const encrypted = await this.signalManager.encryptGroupMessage(groupId, plaintext, members, memberHash);
+        const group = await this.getGroupMembersForEncrypt(groupId);
+        const encrypted = await this.signalManager.encryptGroupMessage(groupId, plaintext, group.members, group.memberHash);
         const payload = this.normalizeGroupEncryptedPayload(groupId, encrypted);
         return this.buildSignalContent(
             "signal_group",
@@ -218,6 +233,28 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
             throw new Error("Invalid nested E2EE group ciphertext payload");
         }
         return payload;
+    }
+
+    private async getGroupMembersForEncrypt(groupId: string): Promise<{ members: any[]; memberHash?: string }> {
+        const cached = this.groupMembersCache.get(groupId);
+        if (cached) {
+            return cached;
+        }
+        const pending = this.groupMembersPromises.get(groupId);
+        if (pending) {
+            return pending;
+        }
+        const promise = (async () => {
+            const members = this.getGroupMembers ? await this.getGroupMembers(groupId) : [];
+            const memberHash = this.getGroupMemberHash ? await this.getGroupMemberHash(groupId, members) : undefined;
+            const result = { members, memberHash };
+            this.groupMembersCache.set(groupId, result);
+            return result;
+        })().finally(() => {
+            this.groupMembersPromises.delete(groupId);
+        });
+        this.groupMembersPromises.set(groupId, promise);
+        return promise;
     }
 
     private buildSignalContent(

@@ -8,6 +8,7 @@ export interface E2EEConfig {
 
   // 并发控制配置
   groupDistributionConcurrency: number;
+  senderKeyEnvelopeConcurrency: number;
   senderKeyDistributionInterval: number;
   maxBatchSize: number;
   minBatchSize: number;
@@ -54,6 +55,7 @@ export const DEFAULT_E2EE_CONFIG: E2EEConfig = {
 
   // 并发控制
   groupDistributionConcurrency: 8,
+  senderKeyEnvelopeConcurrency: 10,
   senderKeyDistributionInterval: 0,
   maxBatchSize: 16,
   minBatchSize: 4,
@@ -183,6 +185,10 @@ export class E2EEConfigManager {
 
     if (config.groupDistributionConcurrency !== undefined && config.groupDistributionConcurrency < 1) {
       errors.push('groupDistributionConcurrency must be at least 1');
+    }
+
+    if (config.senderKeyEnvelopeConcurrency !== undefined && config.senderKeyEnvelopeConcurrency < 1) {
+      errors.push('senderKeyEnvelopeConcurrency must be at least 1');
     }
 
     if (config.maxDevicesPerUser !== undefined && config.maxDevicesPerUser < 1) {

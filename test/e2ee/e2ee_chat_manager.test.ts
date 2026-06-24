@@ -539,7 +539,7 @@ test("e2ee_chat_manager suppresses repeated missing sender key errors for the sa
         console.error = oldError;
     }
 
-    assert.equal(errors.length, 1);
+    assert.equal(errors.length, 0);
 });
 
 test("e2ee_media unwraps server encrypted file responses before media decrypt", async () => {

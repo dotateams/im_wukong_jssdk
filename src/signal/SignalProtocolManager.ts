@@ -288,6 +288,10 @@ export class SignalProtocolManager {
     return this.groupManager.encryptGroupMessage(groupId, plaintext, members, memberHash)
   }
 
+  async prepareGroupSend(groupId: any, members: any, memberHash: any) {
+    return this.groupManager.prepareGroupSend(groupId, members, memberHash)
+  }
+
   async buildGroupDistributionMessage(groupId: any, memberHash: any, forceNewKey: boolean) {
     return this.groupManager.buildGroupDistributionMessage(groupId, memberHash, forceNewKey)
   }

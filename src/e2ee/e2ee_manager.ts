@@ -4,6 +4,7 @@ import type { E2EEDecryptContext, E2EEInitOptions, E2EESendPlan, ResolveSendPlan
 import { SignalE2EEAdapter } from "./e2ee_signal_adapter";
 import { SignalProtocolManager } from "../signal/SignalProtocolManager";
 import { E2EEMediaCrypto } from "./e2ee_media";
+import { E2EEConfigManager } from "../signal/E2EEConfig";
 
 export class E2EEManager {
     private options?: E2EEInitOptions;
@@ -111,6 +112,26 @@ export class E2EEManager {
         const adapter: any = this.options.cryptoAdapter as any;
         if (adapter && typeof adapter.prewarmChannel === "function") {
             await adapter.prewarmChannel(channel);
+        }
+    }
+
+    public async prepareGroupSend(channel: Channel): Promise<void> {
+        if (!this.options || channel.channelType !== ChannelTypeGroup) {
+            return;
+        }
+        const adapter = this.options.cryptoAdapter as any;
+        if (adapter && typeof adapter.prepareGroupSend === "function") {
+            await adapter.prepareGroupSend(channel);
+        }
+    }
+
+    public invalidateGroupMemberCache(channel: Channel): void {
+        if (!this.options || channel.channelType !== ChannelTypeGroup) {
+            return;
+        }
+        const adapter = this.options.cryptoAdapter as any;
+        if (adapter && typeof adapter.invalidateGroupMemberCache === "function") {
+            adapter.invalidateGroupMemberCache(channel.channelID);
         }
     }
 
@@ -269,6 +290,11 @@ export class E2EEManager {
         const apiClient = options.apiClient;
         if (!apiClient || typeof apiClient.get !== "function" || typeof apiClient.post !== "function") {
             return options;
+        }
+        if (options.senderKeyEnvelopeConcurrency !== undefined) {
+            E2EEConfigManager.getInstance().updateConfig({
+                senderKeyEnvelopeConcurrency: options.senderKeyEnvelopeConcurrency,
+            });
         }
         const signalManager = new SignalProtocolManager(options.uid, apiClient, {
             deviceId: options.deviceId,

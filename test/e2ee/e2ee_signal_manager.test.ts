@@ -438,6 +438,134 @@ test("group manager includes sender own devices in sender-key envelopes for hist
     );
 });
 
+test("group manager builds sender-key envelopes with bounded concurrency", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+    manager.senderKeyEnvelopeConcurrency = 3;
+
+    const record = new SenderKeyRecord({
+        memberHash: "members-v2",
+        states: [
+            new SenderKeyState({
+                keyId: 9,
+                senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                chainKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                signingPubKey: "pub",
+                signingPrivKey: "priv",
+                messageIndex: 10,
+                skipped: {},
+                kdfVersion: "v2",
+            }),
+        ],
+    });
+
+    let active = 0;
+    let maxActive = 0;
+    manager.parent = {
+        encryptGroupDistributionForDevice: async (uid: string, _plain: string, devices: any[]) => {
+            active++;
+            maxActive = Math.max(maxActive, active);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            active--;
+            return devices.map((device) => ({
+                enc: "aes-256-gcm",
+                uid,
+                device_id: device.device_id,
+                body: `key:${uid}:${device.device_id}`,
+            }));
+        },
+    };
+
+    const members = Array.from({ length: 12 }).map((_, i) => ({
+        uid: `user-${i}`,
+        devices: [{ device_id: `device-${i}` }],
+    }));
+
+    const distribution = await manager.buildDistributionPayloadForRecord("group-1", record, members, "members-v2");
+
+    assert.equal(distribution.distribution.ciphertexts.length, 12);
+    assert.equal(maxActive, 3);
+});
+
+test("group manager prepareGroupSend uploads envelopes without advancing sender chain", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+    manager.groupEncryptionLocks = new Map();
+    manager.senderKeyEnvelopeConcurrency = 3;
+
+    const record = new SenderKeyRecord({
+        memberHash: "members-v2",
+        states: [
+            new SenderKeyState({
+                keyId: 9,
+                senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                chainKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                signingPubKey: "pub",
+                signingPrivKey: "priv",
+                messageIndex: 0,
+                skipped: {},
+                kdfVersion: "v2",
+            }),
+        ],
+    });
+    let uploaded = 0;
+    let saved = 0;
+
+    manager.normalizeMemberHash = () => "members-v2";
+    manager.loadSenderKeyRecord = async () => null;
+    manager.createSenderKeyRecord = async () => record;
+    manager.buildDistributionPayloadForRecord = async () => ({
+        key_id: 9,
+        member_hash: "members-v2",
+        distribution: {
+            ciphertexts: [
+                { uid: "bob", device_id: "bob-web", enc: "aes-256-gcm", body: "key" },
+            ],
+        },
+    });
+    manager.uploadDistributionEnvelopes = async () => {
+        uploaded += 1;
+    };
+    manager.saveSenderKeyRecord = async () => {
+        saved += 1;
+    };
+
+    await manager.prepareGroupSend("group-1", [{ uid: "bob", devices: [{ device_id: "bob-web" }] }], "members-v2");
+
+    assert.equal(uploaded, 1);
+    assert.equal(saved, 1);
+    assert.equal(record.getState().messageIndex, 0);
+});
+
+test("group manager prepareGroupSend waits for active group encryption lock", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+    manager.groupEncryptionLocks = new Map();
+    let releaseLock: any;
+    manager.groupEncryptionLocks.set("group-1", new Promise((resolve) => {
+        releaseLock = resolve;
+    }));
+
+    let started = false;
+    manager.normalizeMemberHash = () => "members-v2";
+    manager.loadSenderKeyRecord = async () => {
+        started = true;
+        return { memberHash: "members-v2" };
+    };
+    manager.logPerf = () => undefined;
+
+    const pending = manager.prepareGroupSend("group-1", [{ uid: "bob" }], "members-v2");
+    await Promise.resolve();
+    assert.equal(started, false);
+
+    releaseLock();
+    await pending;
+    assert.equal(started, true);
+});
+
 test("sender key state rederives old message key when skipped cache was trimmed", () => {
     const rootKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const fresh = new SenderKeyState({
@@ -811,7 +939,7 @@ test("group manager suppresses repeated permanent missing sender key envelope lo
         assert.equal(first, false);
         assert.equal(second, false);
         assert.equal(attempts, 1);
-        assert.equal(warnings, 1);
+        assert.equal(warnings, 0);
     } finally {
         console.warn = originalWarn;
     }

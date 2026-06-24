@@ -26,6 +26,7 @@ export class GroupManager {
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
   private readonly senderKeyEnvelopeRecoveryBaseDelayMs: number;
+  senderKeyEnvelopeConcurrency: number;
 
   constructor(parent: any, uid: any, deviceId: any) {
     this.parent = parent;
@@ -41,6 +42,7 @@ export class GroupManager {
     this.senderKeyDistributionInterval = Math.max(0, Number(config.senderKeyDistributionInterval || 0));
     this.senderKeyEnvelopeRecoveryMaxAttempts = Math.max(1, Number(config.maxDecryptRetries || 3));
     this.senderKeyEnvelopeRecoveryBaseDelayMs = Math.max(1, Number(config.retryDelayMs || 1000));
+    this.senderKeyEnvelopeConcurrency = Math.max(1, Number(config.senderKeyEnvelopeConcurrency || config.groupDistributionConcurrency || 10));
     this.senderKeyCache = new SmartLRUCache({
       maxSize: config.maxSenderKeyCacheSize,
       ttlMs: config.sessionCacheTTL,
@@ -242,23 +244,93 @@ export class GroupManager {
     await this.signalStore.deleteUserSenderKeys(senderUid);
   }
 
-  async encryptGroupMessage(groupId: any, plaintext: string, members: any, memberHash: any) {
-    const prevLock = this.groupEncryptionLocks.get(groupId) || Promise.resolve();
+  async prepareGroupSend(groupId: any, members: any, memberHash: any) {
+    const startedAt = this.now();
+    const lockKey = groupId;
+    const prevLock = this.groupEncryptionLocks.get(lockKey) || Promise.resolve();
     const currentLock = prevLock.then(async () => {
+      const loadStartedAt = this.now();
       const normalizedMemberHash = this.normalizeMemberHash(memberHash, members);
       let record: any = await this.loadSenderKeyRecord(groupId, this.uid, this.deviceId);
+      const loadMs = this.now() - loadStartedAt;
+      const shouldDistribute = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
+      if (!shouldDistribute) {
+        this.logPerf('prepareGroupSend', {
+          groupId,
+          memberCount: Array.isArray(members) ? members.length : 0,
+          cacheHit: true,
+          loadMs,
+          totalMs: this.now() - startedAt,
+        });
+        return true;
+      }
+      const createStartedAt = this.now();
+      record = await this.createSenderKeyRecord(groupId, normalizedMemberHash, record);
+      const createMs = this.now() - createStartedAt;
+      const buildStartedAt = this.now();
+      const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, normalizedMemberHash);
+      const buildMs = this.now() - buildStartedAt;
+      let uploadMs = 0;
+      if (distribution) {
+        const uploadStartedAt = this.now();
+        await this.uploadDistributionEnvelopes(groupId, distribution);
+        uploadMs = this.now() - uploadStartedAt;
+      }
+      await this.saveSenderKeyRecord(groupId, this.uid, record, this.deviceId);
+      this.logPerf('prepareGroupSend', {
+        groupId,
+        memberCount: Array.isArray(members) ? members.length : 0,
+        envelopeCount: distribution?.distribution?.ciphertexts?.length || 0,
+        cacheHit: false,
+        concurrency: Math.max(1, Number((this as any).senderKeyEnvelopeConcurrency || 10)),
+        loadMs,
+        createMs,
+        buildMs,
+        uploadMs,
+        totalMs: this.now() - startedAt,
+      });
+      return true;
+    });
+    this.groupEncryptionLocks.set(lockKey, currentLock.catch(() => undefined));
+    return await currentLock;
+  }
+
+  async encryptGroupMessage(groupId: any, plaintext: string, members: any, memberHash: any) {
+    const startedAt = this.now();
+    const prevLock = this.groupEncryptionLocks.get(groupId) || Promise.resolve();
+    const currentLock = prevLock.then(async () => {
+      const loadStartedAt = this.now();
+      const normalizedMemberHash = this.normalizeMemberHash(memberHash, members);
+      let record: any = await this.loadSenderKeyRecord(groupId, this.uid, this.deviceId);
+      const loadMs = this.now() - loadStartedAt;
       let shouldDistribute = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
       if (shouldDistribute) {
+        const createStartedAt = this.now();
         record = await this.createSenderKeyRecord(groupId, normalizedMemberHash, record);
+        this.logPerf('createSenderKeyRecord', {
+          groupId,
+          memberCount: Array.isArray(members) ? members.length : 0,
+          totalMs: this.now() - createStartedAt,
+        });
       }
+      const encryptStartedAt = this.now();
       const cipher = new GroupCipher(this.parent, record, groupId, this.uid);
       const encryptResult = await cipher.encrypt(plaintext);
+      const encryptMs = this.now() - encryptStartedAt;
       const payload: any = { ...encryptResult.payload, sender_device_id: this.deviceId };
       shouldDistribute = shouldDistribute || this.shouldRetrySenderKeyDistribution(record, payload);
+      let buildMs = 0;
+      let uploadMs = 0;
+      let envelopeCount = 0;
       if (shouldDistribute) {
+        const buildStartedAt = this.now();
         const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, normalizedMemberHash);
+        buildMs = this.now() - buildStartedAt;
         if (distribution) {
+          envelopeCount = distribution?.distribution?.ciphertexts?.length || 0;
+          const uploadStartedAt = this.now();
           await this.uploadDistributionEnvelopes(groupId, distribution);
+          uploadMs = this.now() - uploadStartedAt;
         }
       }
       // console.log("signal_group payload:", {
@@ -269,6 +341,17 @@ export class GroupManager {
       //   signing_pub_key: payload.signing_pub_key,
       // })
       await this.saveSenderKeyRecord(groupId, this.uid, record, this.deviceId);
+      this.logPerf('encryptGroupMessage', {
+        groupId,
+        memberCount: Array.isArray(members) ? members.length : 0,
+        envelopeCount,
+        distributed: !!shouldDistribute,
+        loadMs,
+        encryptMs,
+        buildMs,
+        uploadMs,
+        totalMs: this.now() - startedAt,
+      });
       return { type: 0, body: JSON.stringify(payload) };
     });
     this.groupEncryptionLocks.set(
@@ -383,6 +466,47 @@ export class GroupManager {
     return interval > 0 && payload.msg_index > 0 && payload.msg_index % interval === 0;
   }
 
+  private async buildEnvelopeCiphertextsForMembers(members: any[], distributionPlain: string, logPrefix: string): Promise<any[]> {
+    const validMembers = (Array.isArray(members) ? members : []).filter((member) => member && member.uid);
+    if (validMembers.length === 0) {
+      return [];
+    }
+    const concurrency = Math.min(
+      validMembers.length,
+      Math.max(1, Number((this as any).senderKeyEnvelopeConcurrency || 10)),
+    );
+    const results: any[][] = new Array(validMembers.length);
+    let nextIndex = 0;
+    const worker = async () => {
+      while (nextIndex < validMembers.length) {
+        const index = nextIndex++;
+        const member = validMembers[index];
+        const ciphertexts: any[] = [];
+        try {
+          const ct = await this.parent.encryptGroupDistributionForDevice(member.uid, distributionPlain, member.devices);
+          if (ct && Array.isArray(ct)) {
+            for (const item of ct) {
+              if (item.enc === 'aes-256-gcm') {
+                ciphertexts.push({
+                  ...item,
+                  uid: member.uid,
+                  is_ecies: true,
+                });
+              } else {
+                ciphertexts.push({ uid: member.uid, device_id: item.device_id, type: item.type, body: item.body });
+              }
+            }
+          }
+        } catch (e) {
+          console.error(`[GroupManager] ${logPrefix} failed for ${member.uid}:`, e);
+        }
+        results[index] = ciphertexts;
+      }
+    };
+    await Promise.all(new Array(concurrency).fill(0).map(() => worker()));
+    return ([] as any[]).concat(...results.filter(Boolean));
+  }
+
   async buildDistributionPayloadForRecord(groupId: any, record: any, members: any, normalizedMemberHash: string) {
     const state: any = record && record.getState();
     if (!state || !Array.isArray(members) || members.length === 0) {
@@ -399,30 +523,11 @@ export class GroupManager {
       kdfVersion: state.kdfVersion,
     });
     const distributionPlain = distributionMessage.toString();
-    const ciphertexts: any[] = [];
-    for (const member of members) {
-      if (!member || !member.uid) {
-        continue;
-      }
-      try {
-        const ct = await this.parent.encryptGroupDistributionForDevice(member.uid, distributionPlain, member.devices);
-        if (ct && Array.isArray(ct)) {
-          for (const item of ct) {
-            if (item.enc === 'aes-256-gcm') {
-              ciphertexts.push({
-                ...item,
-                uid: member.uid,
-                is_ecies: true,
-              });
-            } else {
-              ciphertexts.push({ uid: member.uid, device_id: item.device_id, type: item.type, body: item.body });
-            }
-          }
-        }
-      } catch (e) {
-        console.error(`[GroupManager] Encrypt inline distribution failed for ${member.uid}:`, e);
-      }
-    }
+    const ciphertexts = await this.buildEnvelopeCiphertextsForMembers(
+      members,
+      distributionPlain,
+      'Encrypt inline distribution',
+    );
     if (ciphertexts.length === 0) {
       return null;
     }
@@ -495,46 +600,11 @@ export class GroupManager {
       kdfVersion: state.kdfVersion,
     });
     const distributionPlain = distributionMessage.toString();
-    const ciphertexts: any[] = [];
-    for (const member of members) {
-      if (!member || !member.uid) {
-        continue;
-      }
-      // const deviceIds = Array.isArray(member.deviceIds) ? member.deviceIds : []
-      // for (const deviceId of deviceIds) {
-      try {
-        // Optimization: Check if we have an existing session for this device
-        // const hasSession = await this.parent.hasSession(member.uid, deviceId)
-
-        let ct: any;
-        // if (hasSession) {
-        //    ct = await this.parent.encryptMessage(member.uid, deviceId, distributionPlain)
-        //    if (ct && typeof ct.body === "string") {
-        //      ciphertexts.push({ uid: member.uid, device_id: deviceId, type: ct.type, body: ct.body })
-        //    }
-        // } else {
-        // Fallback to direct device key encryption (ECIES) if no session exists
-        // This avoids the overhead of X3DH session establishment for one-off distribution
-        ct = await this.parent.encryptGroupDistributionForDevice(member.uid, distributionPlain, member.devices);
-        if (ct && Array.isArray(ct)) {
-          // For ECIES, we need to mark it appropriately or use a specific structure
-          for (const item of ct) {
-            if (item.enc === 'aes-256-gcm') {
-              ciphertexts.push({
-                ...item,
-                uid: member.uid,
-                is_ecies: true,
-              });
-            } else {
-              ciphertexts.push({ uid: member.uid, device_id: item.device_id, type: item.type, body: item.body });
-            }
-          }
-        }
-      } catch (e) {
-        console.error(`[GroupManager] Encrypt distribution failed for ${member.uid}:`, e);
-      }
-      // }
-    }
+    const ciphertexts = await this.buildEnvelopeCiphertextsForMembers(
+      members,
+      distributionPlain,
+      'Encrypt distribution',
+    );
     if (ciphertexts.length === 0) {
       return null;
     }
@@ -693,7 +763,10 @@ export class GroupManager {
         if (this.isPermanentEnvelopeLookupError(error)) {
           this.getSenderKeyEnvelopeMissingCache().set(recoveryKey, true);
         }
-        console.warn('[GroupManager] recover sender key envelope failed', error);
+        const config = E2EEConfigManager.getInstance().getConfig();
+        if (config.debugEnabled || config.verboseLogging) {
+          console.warn('[GroupManager] recover sender key envelope failed', error);
+        }
         return false;
       })
       .finally(() => {
@@ -781,6 +854,27 @@ export class GroupManager {
 
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private logPerf(action: string, stats: any) {
+    const config = E2EEConfigManager.getInstance().getConfig();
+    if (!config.debugEnabled && !config.verboseLogging) {
+      return;
+    }
+    const rounded: any = { ...stats };
+    for (const key of ['loadMs', 'createMs', 'encryptMs', 'buildMs', 'uploadMs', 'totalMs']) {
+      if (typeof rounded[key] === 'number') {
+        rounded[key] = Math.round(rounded[key] * 100) / 100;
+      }
+    }
+    console.info(`[E2EE][perf][${action}]`, rounded);
+  }
+
+  private now(): number {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return performance.now();
+    }
+    return Date.now();
   }
 
   async decryptGroupDistributionObject(obj: any, remoteUid: string, remoteDeviceId: any) {
