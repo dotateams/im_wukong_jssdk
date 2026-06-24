@@ -133,6 +133,20 @@ export class SignalProtocolManager {
     StorageService.shared.setItem(key, '1')
   }
 
+  async clearLocalData() {
+    if (this.store && typeof this.store.clearLocalData === 'function') {
+      await this.store.clearLocalData()
+    }
+    if (this.sessionManager && typeof (this.sessionManager as any).clearSessionCache === 'function') {
+      ;(this.sessionManager as any).clearSessionCache()
+    }
+    if (this.groupManager) {
+      ;(this.groupManager as any).senderKeyCache?.clear?.()
+      ;(this.groupManager as any).senderKeyStateCache?.clear?.()
+      ;(this.groupManager as any).senderKeyEnvelopeMissingCache?.clear?.()
+    }
+  }
+
   generateRegistrationId() {
     return this.preKeyManager.generateRegistrationId()
   }

@@ -19,7 +19,6 @@ export class ChatManager {
     sendStatusListeners: MessageStatusListener[] = new Array(); // 消息状态监听
     clientSeq: number = 0
     private e2eePlaintextMemoryCache: Map<string, string> = new Map()
-    private e2eePlaintextSessionTTL: number = 12 * 60 * 60 * 1000
     private e2eeDecryptFailureMemoryCache: Map<string, number> = new Map()
     private e2eeDecryptFailureTTL: number = 10 * 60 * 1000
 
@@ -291,7 +290,6 @@ export class ChatManager {
                 type: plaintextContent.contentType,
                 payload,
                 cachedAt: now,
-                expiresAt: now + this.e2eePlaintextSessionTTL,
             })
             for (const key of keys) {
                 this.e2eePlaintextMemoryCache.set(key, value)
@@ -313,10 +311,6 @@ export class ChatManager {
             }
             try {
                 const data = JSON.parse(cached)
-                if (data.expiresAt && Number(data.expiresAt) < Date.now()) {
-                    this.removeE2EEPlaintextCacheKey(key)
-                    continue
-                }
                 const contentType = Number(data.type || signalContent.realContentType)
                 const content = WKSDK.shared().getMessageContent(contentType)
                 const payload = data.payload || {}

@@ -134,6 +134,16 @@ export class SignalProtocolStore {
     await this._clear(STORES.SESSIONS)
   }
 
+  async clearLocalData() {
+    await this._clear(STORES.IDENTITY_KEYS)
+    await this._clear(STORES.PRE_KEYS)
+    await this._clear(STORES.USED_PRE_KEYS)
+    await this._clear(STORES.SIGNED_PRE_KEYS)
+    await this._clear(STORES.SESSIONS)
+    await this._clear(STORES.KYBER_PRE_KEYS)
+    await this._clear(STORES.SENDER_KEYS)
+  }
+
   async loadKyberPreKey(kyberPreKeyId: any) {
     const data = await this._get(STORES.KYBER_PRE_KEYS, kyberPreKeyId)
     if (!data) {

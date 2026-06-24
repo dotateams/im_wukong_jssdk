@@ -28,6 +28,10 @@ export class E2EEManager {
         this.mediaCrypto = new E2EEMediaCrypto({
             apiClient: this.options.apiClient,
             provider: this.options.mediaProvider,
+            cacheScope: () => ({
+                uid: this.options?.uid,
+                deviceId: this.options?.deviceId,
+            }),
         });
         if (options.apiClient && options.apiClient.registerDeviceKeys) {
             await options.apiClient.registerDeviceKeys(options);
@@ -37,6 +41,21 @@ export class E2EEManager {
     public reset(): void {
         this.options = undefined;
         this.mediaCrypto = undefined;
+    }
+
+    public async clearLocalData(): Promise<void> {
+        const options = this.options;
+        if (!options) {
+            return;
+        }
+        this.clearPlaintextStorage(options.uid, options.deviceId);
+        if (this.mediaCrypto && typeof (this.mediaCrypto as any).clearLocalData === "function") {
+            ;(this.mediaCrypto as any).clearLocalData();
+        }
+        const adapter: any = options.cryptoAdapter as any;
+        if (adapter && typeof adapter.clearLocalData === "function") {
+            await adapter.clearLocalData();
+        }
     }
 
     public async resolveSendPlan(
@@ -148,6 +167,34 @@ export class E2EEManager {
             return undefined;
         }
         return this.mediaCrypto.loadOriginal(content as any);
+    }
+
+    private clearPlaintextStorage(uid: string, deviceId: string): void {
+        const prefix = `wk_e2ee_plaintext:${uid}:${deviceId}:`;
+        for (const storage of [this.getStorage("sessionStorage"), this.getStorage("localStorage")]) {
+            if (!storage) {
+                continue;
+            }
+            const keys: string[] = [];
+            for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                if (key && key.indexOf(prefix) === 0) {
+                    keys.push(key);
+                }
+            }
+            for (const key of keys) {
+                storage.removeItem(key);
+            }
+        }
+    }
+
+    private getStorage(name: "sessionStorage" | "localStorage"): Storage | undefined {
+        try {
+            const storage = (globalThis as any)[name];
+            return storage || undefined;
+        } catch (_error) {
+            return undefined;
+        }
     }
 
     private async resolveChannelInfo(

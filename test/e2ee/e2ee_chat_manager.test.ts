@@ -639,6 +639,42 @@ test("e2ee_media restores file metadata without fetching original until download
     assert.equal(fetchCount, 1);
 });
 
+test("e2ee_media reuses cached decrypted media thumbnails", async () => {
+    installStorageMock("localStorage");
+    const channel = new Channel("receiver", ChannelTypePerson);
+    const mediaStore = new Map<string, Blob>();
+    let fetchCount = 0;
+    const provider = {
+        uploadEncryptedMedia: async (file: Blob, context: any) => {
+            const url = `file/preview/chat/e2ee-${context.kind}.bin`;
+            mediaStore.set(url, file);
+            return url;
+        },
+        fetchEncryptedMedia: async (url: string) => {
+            fetchCount++;
+            const blob = mediaStore.get(url);
+            if (!blob) {
+                throw new Error(`missing encrypted blob ${url}`);
+            }
+            return blob;
+        },
+        createThumbnail: async (blob: Blob) => blob,
+    };
+    const crypto = new E2EEMediaCrypto({ provider } as any);
+    const encrypted = await crypto.encryptContent(
+        new MessageImage(testFile(["thumb body"], "thumb.png", "image/png"), 16, 16),
+        channel,
+    );
+
+    const first = await crypto.restoreContent(encrypted);
+    assert.ok(((first as any).url || "").indexOf("blob:") === 0);
+    assert.equal(fetchCount, 1);
+
+    const second = await crypto.restoreContent(encrypted);
+    assert.ok(((second as any).url || "").indexOf("blob:") === 0);
+    assert.equal(fetchCount, 1);
+});
+
 test("e2ee_media default upload sends api auth headers", async () => {
     const channel = new Channel("receiver", ChannelTypePerson);
     const captured: any[] = [];
@@ -862,7 +898,7 @@ test("e2ee_chat_manager restores self-sent ciphertext after session cache is cle
     assert.equal((replay as any).e2eeDecryptFailed, false);
 });
 
-test("e2ee_chat_manager replaces expired persistent plaintext cache entries", async () => {
+test("e2ee_chat_manager does not expire persistent plaintext cache entries", async () => {
     const persistentStorage = installStorageMock("localStorage");
     const sdk = resetSdk();
     persistentStorage.set("wk_e2ee_plaintext:sender:web-device-1:cno:expired-client", JSON.stringify({
@@ -879,16 +915,17 @@ test("e2ee_chat_manager replaces expired persistent plaintext cache entries", as
         uid: "sender",
         deviceId: "web-device-1",
         cryptoAdapter: {
-            decryptMessage: async () => new MessageText("fresh plaintext"),
+            decryptMessage: async () => {
+                throw new Error("persistent plaintext cache should be used before decrypt");
+            },
         },
     });
 
     await sdk.chatManager.decryptMessageIfNeeded(message);
 
-    const refreshed = JSON.parse(persistentStorage.get("wk_e2ee_plaintext:sender:web-device-1:cno:expired-client") || "{}");
-    assert.equal(refreshed.payload.content, "fresh plaintext");
-    assert.ok(refreshed.expiresAt > Date.now());
-    assert.equal((message.content as MessageText).text, "fresh plaintext");
+    const cached = JSON.parse(persistentStorage.get("wk_e2ee_plaintext:sender:web-device-1:cno:expired-client") || "{}");
+    assert.equal(cached.payload.content, "legacy plaintext");
+    assert.equal((message.content as MessageText).text, "legacy plaintext");
 });
 
 test("e2ee_chat_manager decrypts signal-like content from another package instance", async () => {

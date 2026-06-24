@@ -34,6 +34,7 @@ export interface E2EEDecryptContext {
 export interface E2EECryptoAdapter {
     encryptMessage?: (content: MessageContent, channel: Channel) => Promise<MessageContent>;
     decryptMessage?: (content: MessageContent, channel: Channel, context?: E2EEDecryptContext) => Promise<MessageContent>;
+    clearLocalData?: () => Promise<void>;
 }
 
 export interface E2EEInitOptions {

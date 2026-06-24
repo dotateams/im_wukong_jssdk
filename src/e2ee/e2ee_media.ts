@@ -22,10 +22,12 @@ type MediaPart = {
 export class E2EEMediaCrypto {
     private apiClient?: E2EEApiClient
     private provider?: E2EEMediaProvider
+    private cacheScope?: () => { uid?: string; deviceId?: string | number }
 
-    constructor(options: { apiClient?: E2EEApiClient; provider?: E2EEMediaProvider } = {}) {
+    constructor(options: { apiClient?: E2EEApiClient; provider?: E2EEMediaProvider; cacheScope?: () => { uid?: string; deviceId?: string | number } } = {}) {
         this.apiClient = options.apiClient
         this.provider = options.provider
+        this.cacheScope = options.cacheScope
     }
 
     public canEncrypt(content: MessageContent): boolean {
@@ -93,7 +95,9 @@ export class E2EEMediaCrypto {
             return this.restoreDeferredOriginal(content)
         }
         const displayPart = content.thumb || content.original
-        const displayBlob = await this.decryptPart(displayPart)
+        const displayBlob = displayPart === content.thumb
+            ? await this.decryptCachedThumbnailPart(content, displayPart)
+            : await this.decryptPart(displayPart)
         const displayUrl = this.createObjectURL(displayBlob)
         const restored = MessageContentManager.shared().getMessageContent(content.originalContentType)
         const payload: any = {
@@ -158,6 +162,16 @@ export class E2EEMediaCrypto {
         return media.originalBlobUrl
     }
 
+    public clearLocalData(): void {
+        const storage = this.getLocalStorage()
+        const scope = this.cacheScope ? this.cacheScope() : {}
+        if (!storage || !scope.uid || scope.deviceId === undefined || scope.deviceId === null) {
+            return
+        }
+        const prefix = `wk_e2ee_media_thumb:${scope.uid}:${String(scope.deviceId)}:`
+        this.removeStorageKeysByPrefix(storage, prefix)
+    }
+
     private async encryptBlob(blob: Blob): Promise<{ blob: Blob; key: string; nonce: string; sha256: string }> {
         const subtle = this.subtleCrypto()
         const keyBytes = this.randomBytes(32)
@@ -188,6 +202,70 @@ export class E2EEMediaCrypto {
         const cryptoKey = await subtle.importKey("raw", keyBytes, { name: "AES-GCM", length: 256 }, false, ["decrypt"])
         const decrypted = await subtle.decrypt({ name: "AES-GCM", iv: nonceBytes }, cryptoKey, await encrypted.arrayBuffer())
         return new Blob([decrypted], { type: part.mime || "application/octet-stream" })
+    }
+
+    private async decryptCachedThumbnailPart(content: MessageEncryptedMedia, part: MediaPart): Promise<Blob> {
+        const cached = this.restoreThumbnailCache(content, part)
+        if (cached) {
+            return cached
+        }
+        const blob = await this.decryptPart(part)
+        await this.saveThumbnailCache(content, part, blob)
+        return blob
+    }
+
+    private restoreThumbnailCache(content: MessageEncryptedMedia, part: MediaPart): Blob | undefined {
+        const storage = this.getLocalStorage()
+        const key = this.thumbnailCacheKey(content, part)
+        if (!storage || !key) {
+            return undefined
+        }
+        try {
+            const raw = storage.getItem(key)
+            if (!raw) {
+                return undefined
+            }
+            const data = JSON.parse(raw)
+            if (!data || data.sha256 !== part.sha256 || typeof data.bytes !== "string") {
+                storage.removeItem(key)
+                return undefined
+            }
+            const bytes = this.base64Decode(data.bytes)
+            return new Blob([bytes], { type: data.mime || part.mime || "application/octet-stream" })
+        } catch (_error) {
+            storage.removeItem(key)
+            return undefined
+        }
+    }
+
+    private async saveThumbnailCache(content: MessageEncryptedMedia, part: MediaPart, blob: Blob): Promise<void> {
+        const storage = this.getLocalStorage()
+        const key = this.thumbnailCacheKey(content, part)
+        if (!storage || !key) {
+            return
+        }
+        try {
+            const bytes = new Uint8Array(await blob.arrayBuffer())
+            storage.setItem(key, JSON.stringify({
+                sha256: part.sha256,
+                mime: blob.type || part.mime || "application/octet-stream",
+                bytes: this.base64Encode(bytes),
+                cachedAt: Date.now(),
+            }))
+        } catch (_error) {
+            // Thumbnail cache is best-effort; display must continue from the decrypted blob.
+        }
+    }
+
+    private thumbnailCacheKey(content: MessageEncryptedMedia, part: MediaPart): string {
+        if (!part || !part.sha256) {
+            return ""
+        }
+        const scope = this.cacheScope ? this.cacheScope() : {}
+        const uid = scope.uid || "anonymous"
+        const deviceId = scope.deviceId === undefined || scope.deviceId === null ? "unknown-device" : String(scope.deviceId)
+        const mediaIdentity = `${content.originalContentType || ""}:${content.mediaKind || ""}:${part.url || ""}:${part.sha256}`
+        return `wk_e2ee_media_thumb:${uid}:${deviceId}:${this.hashString(mediaIdentity)}`
     }
 
     private async uploadEncryptedBlob(
@@ -412,6 +490,40 @@ export class E2EEMediaCrypto {
         return bytes
     }
 
+    private base64Encode(bytes: Uint8Array): string {
+        let binary = ""
+        for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i])
+        }
+        return typeof btoa === "function"
+            ? btoa(binary)
+            : (Buffer as any).from(binary, "binary").toString("base64")
+    }
+
+    private getLocalStorage(): Storage | undefined {
+        try {
+            if (typeof localStorage !== "undefined") {
+                return localStorage
+            }
+        } catch (_error) {
+            return undefined
+        }
+        return undefined
+    }
+
+    private removeStorageKeysByPrefix(storage: Storage, prefix: string): void {
+        const keys: string[] = []
+        for (let i = 0; i < storage.length; i++) {
+            const key = storage.key(i)
+            if (key && key.indexOf(prefix) === 0) {
+                keys.push(key)
+            }
+        }
+        for (const key of keys) {
+            storage.removeItem(key)
+        }
+    }
+
     private createObjectURL(blob: Blob): string {
         if (typeof URL !== "undefined" && URL.createObjectURL) {
             return URL.createObjectURL(blob)
@@ -455,5 +567,13 @@ export class E2EEMediaCrypto {
             binary += String.fromCharCode(bytes[i])
         }
         return binary
+    }
+
+    private hashString(value: string): string {
+        let hash = 0
+        for (let i = 0; i < value.length; i++) {
+            hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0
+        }
+        return String(hash >>> 0)
     }
 }

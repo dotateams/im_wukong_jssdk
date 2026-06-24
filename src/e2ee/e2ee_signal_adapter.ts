@@ -53,6 +53,13 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         await this.getGroupMembers(channel.channelID);
     }
 
+    public async clearLocalData(): Promise<void> {
+        const manager: any = this.signalManager as any;
+        if (manager && typeof manager.clearLocalData === "function") {
+            await manager.clearLocalData();
+        }
+    }
+
     public async encryptMessage(content: MessageContent, channel: Channel): Promise<MessageContent> {
         if (this.isSignalContent(content)) {
             return content;
