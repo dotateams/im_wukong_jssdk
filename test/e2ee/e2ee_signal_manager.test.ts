@@ -775,6 +775,48 @@ test("group manager retries transient sender key envelope lookup failure", async
     assert.ok(saved);
 });
 
+test("group manager suppresses repeated permanent missing sender key envelope lookups", async () => {
+    const originalWarn = console.warn;
+    let warnings = 0;
+    console.warn = () => {
+        warnings++;
+    };
+    const manager: any = Object.create(GroupManager.prototype);
+    try {
+        manager.uid = "bob";
+        manager.deviceId = "bob-h5";
+        manager.groupEnvelopeRecoveryPromises = new Map();
+        manager.senderKeyEnvelopeRecoveryMaxAttempts = 3;
+        manager.senderKeyEnvelopeRecoveryBaseDelayMs = 1;
+
+        let attempts = 0;
+        manager.parent = {
+            lookupGroupSenderKeyEnvelope: async () => {
+                attempts++;
+                const error: any = new Error("not found");
+                error.status = 404;
+                throw error;
+            },
+        };
+
+        const first = await manager.recoverSenderKeyFromEnvelope({
+            group_id: "group-1",
+            key_id: 9,
+        }, "alice", "alice-web");
+        const second = await manager.recoverSenderKeyFromEnvelope({
+            group_id: "group-1",
+            key_id: 9,
+        }, "alice", "alice-web");
+
+        assert.equal(first, false);
+        assert.equal(second, false);
+        assert.equal(attempts, 1);
+        assert.equal(warnings, 1);
+    } finally {
+        console.warn = originalWarn;
+    }
+});
+
 test("group manager member hash changes when e2ee member devices change", () => {
     const manager: any = Object.create(GroupManager.prototype);
     const baseHash = manager.normalizeMemberHash(undefined, [

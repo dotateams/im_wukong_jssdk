@@ -21,6 +21,7 @@ export class GroupManager {
   private senderKeyStateCache: SmartLRUCache<string, any>;
   private senderKeyEnvelopeUploadCache: SmartLRUCache<string, boolean>;
   private senderKeyEnvelopeUploadPromises: Map<string, Promise<void>>;
+  private senderKeyEnvelopeMissingCache: SmartLRUCache<string, boolean>;
   private readonly senderKeyDistributionRetryWindow = 1;
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
@@ -51,6 +52,10 @@ export class GroupManager {
     this.senderKeyEnvelopeUploadCache = new SmartLRUCache({
       maxSize: config.maxDistributionCacheSize,
       ttlMs: config.senderKeyEnvelopeUploadCacheTTL,
+    });
+    this.senderKeyEnvelopeMissingCache = new SmartLRUCache({
+      maxSize: 5000,
+      ttlMs: 60 * 1000,
     });
   }
 
@@ -676,12 +681,18 @@ export class GroupManager {
       this.groupEnvelopeRecoveryPromises = new Map();
     }
     const recoveryKey = `${groupId}:${senderUid}:${senderDeviceId}:${keyId}:${this.uid}:${this.deviceId}`;
+    if (this.getSenderKeyEnvelopeMissingCache().get(recoveryKey)) {
+      return false;
+    }
     const existing = this.groupEnvelopeRecoveryPromises.get(recoveryKey);
     if (existing) {
       return existing;
     }
     const promise = this.doRecoverSenderKeyFromEnvelope(groupId, senderUid, senderDeviceId, keyId)
       .catch((error) => {
+        if (this.isPermanentEnvelopeLookupError(error)) {
+          this.getSenderKeyEnvelopeMissingCache().set(recoveryKey, true);
+        }
         console.warn('[GroupManager] recover sender key envelope failed', error);
         return false;
       })
@@ -690,6 +701,16 @@ export class GroupManager {
       });
     this.groupEnvelopeRecoveryPromises.set(recoveryKey, promise);
     return promise;
+  }
+
+  private getSenderKeyEnvelopeMissingCache(): SmartLRUCache<string, boolean> {
+    if (!this.senderKeyEnvelopeMissingCache) {
+      this.senderKeyEnvelopeMissingCache = new SmartLRUCache({
+        maxSize: 5000,
+        ttlMs: 60 * 1000,
+      });
+    }
+    return this.senderKeyEnvelopeMissingCache;
   }
 
   private async doRecoverSenderKeyFromEnvelope(groupId: any, senderUid: string, senderDeviceId: any, keyId: any): Promise<boolean> {
