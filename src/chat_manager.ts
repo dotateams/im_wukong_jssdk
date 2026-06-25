@@ -9,6 +9,9 @@ import { SecurityManager } from "./security";
 
 export type MessageListener = ((message: Message) => void);
 export type MessageStatusListener = ((p: SendackPacket) => void);
+export interface DecryptMessageOptions {
+    realtime?: boolean;
+}
 
 export class ChatManager {
     cmdListeners: ((message: Message) => void)[] = new Array(); // 命令类消息监听
@@ -64,7 +67,7 @@ export class ChatManager {
 
             const message = new Message(recvPacket)
             this.debugRawReceivedMessage(message)
-            await this.decryptMessageIfNeeded(message)
+            await this.decryptMessageIfNeeded(message, { realtime: true })
             this.sendRecvackPacket(recvPacket);
             if (message.contentType === MessageContentType.cmd) { // 命令类消息分流处理
                 this.notifyCMDListeners(message);
@@ -181,7 +184,7 @@ export class ChatManager {
         return sdk.config.e2ee.encryptMessage(content, channel)
     }
 
-    async decryptMessageIfNeeded(message: Message): Promise<void> {
+    async decryptMessageIfNeeded(message: Message, options: DecryptMessageOptions = {}): Promise<void> {
         if (!this.isSignalMessageContent(message.content)) {
             return
         }
@@ -207,26 +210,40 @@ export class ChatManager {
             }
         }
         this.debugE2EEDecrypt("before", message, message.content)
+        const decryptContext = {
+            message,
+            fromUID: message.fromUID,
+            senderDeviceId: signalContent.senderDeviceId,
+        }
         try {
-            message.content = await WKSDK.shared().config.e2ee.decryptMessage(message.content, message.channel, {
-                message,
-                fromUID: message.fromUID,
-                senderDeviceId: signalContent.senderDeviceId,
-            })
+            message.content = await WKSDK.shared().config.e2ee.decryptMessage(message.content, message.channel, decryptContext)
             this.cacheE2EEPlaintext(message, signalContent, message.content)
             this.debugE2EEDecrypt("after", message, message.content)
             ;(message as any).e2eeDecryptFailed = false
         } catch (error) {
+            const recovered = await this.recoverRealtimeE2EEDecryptFailure(message, signalContent, decryptContext, error, options)
+            if (recovered) {
+                try {
+                    message.content = await WKSDK.shared().config.e2ee.decryptMessage(signalContent, message.channel, decryptContext)
+                    this.cacheE2EEPlaintext(message, signalContent, message.content)
+                    this.debugE2EEDecrypt("after", message, message.content)
+                    ;(message as any).e2eeDecryptFailed = false
+                    ;(message as any).e2eeDecryptError = undefined
+                    return
+                } catch (retryError) {
+                    error = retryError
+                }
+            }
             ;(message as any).e2eeDecryptFailed = true
             ;(message as any).e2eeDecryptError = error
-            this.debugE2EEDecryptFailure(message, message.content, error)
-            const shouldLog = this.markE2EEDecryptFailureIfNeeded(message, message.content, error)
+            this.debugE2EEDecryptFailure(message, signalContent, error)
+            const shouldLog = this.markE2EEDecryptFailureIfNeeded(message, signalContent, error)
             if (shouldLog) {
                 const detail = {
                     channelID: message.channel && message.channel.channelID,
                     channelType: message.channel && message.channel.channelType,
                     fromUID: message.fromUID,
-                    senderDeviceId: message.content.senderDeviceId,
+                    senderDeviceId: signalContent.senderDeviceId,
                     messageID: message.messageID,
                     clientMsgNo: message.clientMsgNo,
                 }
@@ -239,6 +256,39 @@ export class ChatManager {
                 }
             }
             message.content = this.buildE2EEDecryptFailureContent(error)
+        }
+    }
+
+    private async recoverRealtimeE2EEDecryptFailure(
+        message: Message,
+        signalContent: MessageSignalContent,
+        context: { message: Message; fromUID: string; senderDeviceId: string | number },
+        error: any,
+        options: DecryptMessageOptions,
+    ): Promise<boolean> {
+        if (!options.realtime || !WKSDK.shared().config.e2ee.recoverDecryptFailure) {
+            return false
+        }
+        try {
+            return await WKSDK.shared().config.e2ee.recoverDecryptFailure(signalContent, message.channel, {
+                message,
+                fromUID: message.fromUID,
+                senderDeviceId: signalContent.senderDeviceId,
+                error,
+                realtime: true,
+            })
+        } catch (recoverError) {
+            if (WKSDK.shared().config.debug) {
+                console.warn("[E2EE] realtime decrypt recovery failed", {
+                    channelID: message.channel && message.channel.channelID,
+                    channelType: message.channel && message.channel.channelType,
+                    fromUID: message.fromUID,
+                    senderDeviceId: signalContent.senderDeviceId,
+                    messageID: message.messageID,
+                    clientMsgNo: message.clientMsgNo,
+                }, recoverError)
+            }
+            return false
         }
     }
 

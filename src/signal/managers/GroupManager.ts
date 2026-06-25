@@ -22,12 +22,15 @@ export class GroupManager {
   private senderKeyEnvelopeUploadCache: SmartLRUCache<string, boolean>;
   private senderKeyEnvelopeUploadPromises: Map<string, Promise<void>>;
   private senderKeyEnvelopeMissingCache: SmartLRUCache<string, boolean>;
+  private senderKeyEnvelopeForceLookupCache: SmartLRUCache<string, boolean>;
   private senderKeyRepairRequestCache: SmartLRUCache<string, boolean>;
   private readonly senderKeyDistributionRetryWindow = 1;
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
   private readonly senderKeyEnvelopeRecoveryBaseDelayMs: number;
   senderKeyEnvelopeConcurrency: number;
+  private identityRepairGeneration: number;
+  private identityRepairDistributionGroups: Set<string>;
 
   constructor(parent: any, uid: any, deviceId: any) {
     this.parent = parent;
@@ -36,6 +39,8 @@ export class GroupManager {
     this.groupEncryptionLocks = new Map();
     this.groupEnvelopeRecoveryPromises = new Map();
     this.senderKeyEnvelopeUploadPromises = new Map();
+    this.identityRepairGeneration = 0;
+    this.identityRepairDistributionGroups = new Set();
     this.signalStore = new SignalProtocolStoreClass(uid, deviceId);
 
     // 初始化智能缓存
@@ -57,6 +62,10 @@ export class GroupManager {
       ttlMs: config.senderKeyEnvelopeUploadCacheTTL,
     });
     this.senderKeyEnvelopeMissingCache = new SmartLRUCache({
+      maxSize: 5000,
+      ttlMs: 60 * 1000,
+    });
+    this.senderKeyEnvelopeForceLookupCache = new SmartLRUCache({
       maxSize: 5000,
       ttlMs: 60 * 1000,
     });
@@ -84,6 +93,36 @@ export class GroupManager {
       senderKeyCache: this.senderKeyCache.getStats(),
       senderKeyStateCache: this.senderKeyStateCache.getStats(),
     };
+  }
+
+  markLocalIdentityRepaired() {
+    this.identityRepairGeneration++;
+    this.identityRepairDistributionGroups = new Set();
+    this.senderKeyEnvelopeUploadCache?.clear?.();
+    this.senderKeyEnvelopeUploadPromises?.clear?.();
+    this.senderKeyEnvelopeMissingCache?.clear?.();
+    this.senderKeyEnvelopeForceLookupCache?.clear?.();
+    this.senderKeyRepairRequestCache?.clear?.();
+    this.senderKeyStateCache?.clear?.();
+  }
+
+  private getIdentityRepairDistributionKey(groupId: any): string {
+    return `${this.identityRepairGeneration}:${groupId}`;
+  }
+
+  private shouldReuploadAfterIdentityRepair(groupId: any, record: any): boolean {
+    if (!this.identityRepairGeneration || !record) {
+      return false;
+    }
+    const key = this.getIdentityRepairDistributionKey(groupId);
+    return !this.identityRepairDistributionGroups.has(key);
+  }
+
+  private markIdentityRepairDistributionDone(groupId: any) {
+    if (!this.identityRepairGeneration) {
+      return;
+    }
+    this.identityRepairDistributionGroups.add(this.getIdentityRepairDistributionKey(groupId));
   }
 
   normalizeMemberHash(memberHash: any, members: any) {
@@ -258,8 +297,9 @@ export class GroupManager {
       const normalizedMemberHash = this.normalizeMemberHash(memberHash, members);
       let record: any = await this.loadSenderKeyRecord(groupId, this.uid, this.deviceId);
       const loadMs = this.now() - loadStartedAt;
-      const shouldDistribute = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
-      if (!shouldDistribute) {
+      const shouldCreateSenderKey = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
+      const shouldReuploadForIdentityRepair = this.shouldReuploadAfterIdentityRepair(groupId, record);
+      if (!shouldCreateSenderKey && !shouldReuploadForIdentityRepair) {
         const repairStartedAt = this.now();
         const repairCount = await this.uploadPendingRepairEnvelopes(groupId, record, normalizedMemberHash);
         const repairMs = this.now() - repairStartedAt;
@@ -275,7 +315,9 @@ export class GroupManager {
         return true;
       }
       const createStartedAt = this.now();
-      record = await this.createSenderKeyRecord(groupId, normalizedMemberHash, record);
+      if (shouldCreateSenderKey) {
+        record = await this.createSenderKeyRecord(groupId, normalizedMemberHash, record);
+      }
       const createMs = this.now() - createStartedAt;
       const buildStartedAt = this.now();
       const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, normalizedMemberHash);
@@ -285,6 +327,9 @@ export class GroupManager {
         const uploadStartedAt = this.now();
         await this.uploadDistributionEnvelopes(groupId, distribution);
         uploadMs = this.now() - uploadStartedAt;
+        if (shouldReuploadForIdentityRepair) {
+          this.markIdentityRepairDistributionDone(groupId);
+        }
       }
       await this.saveSenderKeyRecord(groupId, this.uid, record, this.deviceId);
       this.logPerf('prepareGroupSend', {
@@ -313,8 +358,9 @@ export class GroupManager {
       const normalizedMemberHash = this.normalizeMemberHash(memberHash, members);
       let record: any = await this.loadSenderKeyRecord(groupId, this.uid, this.deviceId);
       const loadMs = this.now() - loadStartedAt;
-      let shouldDistribute = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
-      if (shouldDistribute) {
+      const shouldCreateSenderKey = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
+      const shouldReuploadForIdentityRepair = this.shouldReuploadAfterIdentityRepair(groupId, record);
+      if (shouldCreateSenderKey) {
         const createStartedAt = this.now();
         record = await this.createSenderKeyRecord(groupId, normalizedMemberHash, record);
         this.logPerf('createSenderKeyRecord', {
@@ -328,7 +374,7 @@ export class GroupManager {
       const encryptResult = await cipher.encrypt(plaintext);
       const encryptMs = this.now() - encryptStartedAt;
       const payload: any = { ...encryptResult.payload, sender_device_id: this.deviceId };
-      shouldDistribute = shouldDistribute || this.shouldRetrySenderKeyDistribution(record, payload);
+      const shouldDistribute = shouldCreateSenderKey || shouldReuploadForIdentityRepair || this.shouldRetrySenderKeyDistribution(record, payload);
       let buildMs = 0;
       let uploadMs = 0;
       let envelopeCount = 0;
@@ -341,6 +387,9 @@ export class GroupManager {
           const uploadStartedAt = this.now();
           await this.uploadDistributionEnvelopes(groupId, distribution);
           uploadMs = this.now() - uploadStartedAt;
+          if (shouldReuploadForIdentityRepair) {
+            this.markIdentityRepairDistributionDone(groupId);
+          }
         }
       }
       // console.log("signal_group payload:", {
@@ -757,8 +806,8 @@ export class GroupManager {
     let record: any = await this.loadSenderKeyRecord(groupId, senderUid, senderDeviceId);
     if (obj.distribution && Array.isArray(obj.distribution.ciphertexts)) {
       const matched = this.parent.selectCiphertextForDevice(obj.distribution.ciphertexts, this.uid, this.deviceId);
+      let distributionPlain: any = null;
       if (matched) {
-        let distributionPlain: any = null;
         try {
           if (obj.distribution.type === 'ecies_multi' || matched.is_ecies) {
             distributionPlain = await this.parent.decryptGroupDistributionForDevice(matched);
@@ -780,8 +829,16 @@ export class GroupManager {
             },
             e,
           );
-          throw e;
+          distributionPlain = null;
         }
+        if (!distributionPlain) {
+          const recovered = await this.recoverSenderKeyFromEnvelope(obj, senderUid, senderDeviceId);
+          if (recovered) {
+            record = await this.loadSenderKeyRecord(groupId, senderUid, senderDeviceId);
+          }
+        }
+      }
+      if (distributionPlain) {
         try {
           const distributionMessage = SenderKeyDistributionMessage.fromString(distributionPlain);
           if (distributionMessage) {
@@ -851,7 +908,12 @@ export class GroupManager {
     return !!record.getStateByKeyId(keyId);
   }
 
-  async recoverSenderKeyFromEnvelope(obj: any, senderUid: string, senderDeviceId: any): Promise<boolean> {
+  async recoverSenderKeyFromEnvelope(
+    obj: any,
+    senderUid: string,
+    senderDeviceId: any,
+    options: { force?: boolean; reason?: string } = {},
+  ): Promise<boolean> {
     if (!this.parent || typeof this.parent.lookupGroupSenderKeyEnvelope !== 'function') {
       return false;
     }
@@ -864,7 +926,11 @@ export class GroupManager {
       this.groupEnvelopeRecoveryPromises = new Map();
     }
     const recoveryKey = `${groupId}:${senderUid}:${senderDeviceId}:${keyId}:${this.uid}:${this.deviceId}`;
-    if (this.getSenderKeyEnvelopeMissingCache().get(recoveryKey)) {
+    if (!options.force && this.getSenderKeyEnvelopeMissingCache().get(recoveryKey)) {
+      return false;
+    }
+    const forceLookupCache = this.getSenderKeyEnvelopeForceLookupCache();
+    if (options.force && forceLookupCache.get(recoveryKey)) {
       return false;
     }
     const existing = this.groupEnvelopeRecoveryPromises.get(recoveryKey);
@@ -878,16 +944,22 @@ export class GroupManager {
       key_id: keyId,
       recipient_uid: this.uid,
       recipient_device_id: this.deviceId,
-      reason: 'missing_sender_key',
+      reason: options.reason || 'missing_sender_key',
     };
     const promise = this.doRecoverSenderKeyFromEnvelope(groupId, senderUid, senderDeviceId, keyId)
       .then(async (recovered) => {
         if (!recovered) {
+          if (options.force) {
+            forceLookupCache.set(recoveryKey, true);
+          }
           await this.requestSenderKeyRepair(repairPayload);
         }
         return recovered;
       })
       .catch((error) => {
+        if (options.force) {
+          forceLookupCache.set(recoveryKey, true);
+        }
         if (this.isPermanentEnvelopeLookupError(error)) {
           this.getSenderKeyEnvelopeMissingCache().set(recoveryKey, true);
         }
@@ -932,6 +1004,16 @@ export class GroupManager {
       });
     }
     return this.senderKeyEnvelopeMissingCache;
+  }
+
+  private getSenderKeyEnvelopeForceLookupCache(): SmartLRUCache<string, boolean> {
+    if (!this.senderKeyEnvelopeForceLookupCache) {
+      this.senderKeyEnvelopeForceLookupCache = new SmartLRUCache({
+        maxSize: 5000,
+        ttlMs: 60 * 1000,
+      });
+    }
+    return this.senderKeyEnvelopeForceLookupCache;
   }
 
   private async doRecoverSenderKeyFromEnvelope(groupId: any, senderUid: string, senderDeviceId: any, keyId: any): Promise<boolean> {

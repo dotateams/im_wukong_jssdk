@@ -7,7 +7,7 @@ import {
     MessageContentManager,
     MessageSignalContent,
 } from "../model";
-import type { E2EEDecryptContext, E2EECryptoAdapter } from "./e2ee_types";
+import type { E2EEDecryptContext, E2EECryptoAdapter, E2EERecoverContext } from "./e2ee_types";
 
 export interface SignalLikeManager {
     deviceId?: string | number;
@@ -18,6 +18,7 @@ export interface SignalLikeManager {
     prepareGroupSend?(groupId: string, members?: any, memberHash?: any): Promise<any>;
     requestGroupSenderKeyRepair?(payload: any): Promise<any>;
     lookupGroupSenderKeyRepairRequests?(payload: any): Promise<any>;
+    recoverGroupMessageDecryptFailure?(obj: any, senderUid: string, senderDeviceId: any): Promise<boolean>;
 }
 
 export interface SignalE2EEAdapterOptions {
@@ -116,6 +117,40 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
             signalContent.ciphertext,
         );
         return this.decodePlaintextToContent(plaintext, signalContent.realContentType);
+    }
+
+    public async recoverDecryptFailure(
+        content: MessageContent,
+        channel: Channel,
+        context?: E2EERecoverContext,
+    ): Promise<boolean> {
+        if (channel.channelType !== ChannelTypeGroup || !this.isSignalContent(content)) {
+            return false;
+        }
+        if (!this.signalManager.recoverGroupMessageDecryptFailure) {
+            return false;
+        }
+        const signalContent = content as MessageSignalContent;
+        if (signalContent.messageType !== "signal_group") {
+            return false;
+        }
+        const senderUid = this.resolveSenderUid(channel, context);
+        const senderDeviceId = context?.senderDeviceId || signalContent.senderDeviceId;
+        if (!senderUid || !senderDeviceId) {
+            return false;
+        }
+        let obj: any = signalContent.ciphertext;
+        if (typeof obj === "string") {
+            try {
+                obj = JSON.parse(obj);
+            } catch (_error) {
+                return false;
+            }
+        }
+        if (!obj || obj.type !== "signal_group") {
+            return false;
+        }
+        return this.signalManager.recoverGroupMessageDecryptFailure(obj, senderUid, senderDeviceId);
     }
 
     private isSignalContent(content: MessageContent | any): boolean {

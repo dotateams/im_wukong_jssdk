@@ -55,6 +55,7 @@ export class SignalProtocolManager {
       store: this.store,
       toBase64: this.toBase64.bind(this),
       ensureWebCrypto: this.ensureWebCrypto.bind(this),
+      onIdentityRepaired: this.handleLocalIdentityRepaired.bind(this),
     })
     this.sessionManager = new SessionManager({
       uid: this.uid,
@@ -144,6 +145,15 @@ export class SignalProtocolManager {
       ;(this.groupManager as any).senderKeyCache?.clear?.()
       ;(this.groupManager as any).senderKeyStateCache?.clear?.()
       ;(this.groupManager as any).senderKeyEnvelopeMissingCache?.clear?.()
+    }
+  }
+
+  handleLocalIdentityRepaired() {
+    if (this.keyBundleDirectory && typeof (this.keyBundleDirectory as any).clearCache === 'function') {
+      ;(this.keyBundleDirectory as any).clearCache()
+    }
+    if (this.groupManager && typeof (this.groupManager as any).markLocalIdentityRepaired === 'function') {
+      ;(this.groupManager as any).markLocalIdentityRepaired()
     }
   }
 
@@ -302,6 +312,16 @@ export class SignalProtocolManager {
 
   async decryptGroupMessageObject(obj: any, remoteUid: string, remoteDeviceId: any) {
     return this.groupManager.decryptGroupMessageObject(obj, remoteUid, remoteDeviceId)
+  }
+
+  async recoverGroupMessageDecryptFailure(obj: any, remoteUid: string, remoteDeviceId: any) {
+    if (!obj || obj.type !== "signal_group") {
+      return false
+    }
+    return this.groupManager.recoverSenderKeyFromEnvelope(obj, remoteUid, remoteDeviceId, {
+      force: true,
+      reason: "realtime_decrypt_failure",
+    })
   }
 
   async decryptGroupDistributionObject(obj: any, remoteUid: string, remoteDeviceId: any) {

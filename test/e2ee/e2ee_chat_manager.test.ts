@@ -1127,6 +1127,80 @@ test("e2ee_chat_manager undecryptable signal content marks failure state", async
     assert.equal(errors[0][0], "[E2EE] decrypt failed");
 });
 
+test("e2ee_chat_manager realtime signal content recovers and retries decrypt once", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.content = signalContent("signal_group");
+    let decryptCalls = 0;
+    let recoverCalls = 0;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                if (decryptCalls === 1) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText("recovered realtime");
+            },
+            recoverDecryptFailure: async (_content: any, target: Channel, context: any) => {
+                recoverCalls++;
+                assert.equal(target.channelID, "group-1");
+                assert.equal(context.fromUID, "member-1");
+                assert.equal(context.error.message, "Missing sender key");
+                return true;
+            },
+        } as any,
+    });
+
+    await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true } as any);
+
+    assert.equal(decryptCalls, 2);
+    assert.equal(recoverCalls, 1);
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.equal((message.content as MessageText).text, "recovered realtime");
+});
+
+test("e2ee_chat_manager history signal content does not trigger strong recovery", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.content = signalContent("signal_group");
+    let recoverCalls = 0;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                throw new Error("Missing sender key");
+            },
+            recoverDecryptFailure: async () => {
+                recoverCalls++;
+                return true;
+            },
+        } as any,
+    });
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message);
+    } finally {
+        console.error = originalError;
+    }
+
+    assert.equal(recoverCalls, 0);
+    assert.equal((message as any).e2eeDecryptFailed, true);
+});
+
 test("e2ee_chat_manager logs failed decrypt detail when debug is enabled", async () => {
     const sdk = resetSdk();
     const channel = new Channel("receiver", ChannelTypePerson);

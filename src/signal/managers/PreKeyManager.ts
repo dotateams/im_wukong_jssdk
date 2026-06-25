@@ -12,6 +12,7 @@ export class PreKeyManager {
   preKeyTimer: any
   signedPreKeyTimer: any
   lastPreKeyCheckAt: any
+  onIdentityRepaired?: () => void | Promise<void>
 
   constructor(params: {
     uid: any
@@ -21,6 +22,7 @@ export class PreKeyManager {
     store: any
     toBase64: (data: any) => string
     ensureWebCrypto: () => void
+    onIdentityRepaired?: () => void | Promise<void>
   }) {
     this.uid = params.uid
     this.deviceId = params.deviceId
@@ -29,6 +31,7 @@ export class PreKeyManager {
     this.store = params.store
     this.toBase64 = params.toBase64
     this.ensureWebCrypto = params.ensureWebCrypto
+    this.onIdentityRepaired = params.onIdentityRepaired
     this.preKeyTimer = null
     this.signedPreKeyTimer = null
     this.lastPreKeyCheckAt = 0
@@ -50,6 +53,9 @@ export class PreKeyManager {
         })
         const bundle = await this.generateBundleForExistingIdentity(identityKeyPair, currentDevice.signedPreKeyId)
         await this.uploadPreKeys(bundle)
+        if (this.onIdentityRepaired) {
+          await this.onIdentityRepaired()
+        }
       } else if (!(await this.hasLocalSignedPreKey(currentDevice.signedPreKeyId))) {
         const bundle = await this.generateBundleForExistingIdentity(identityKeyPair, currentDevice.signedPreKeyId)
         await this.uploadPreKeys(bundle)

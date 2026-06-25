@@ -53,6 +53,11 @@ export class KeyBundleDirectory {
     this.cacheTtlMs = 30 * 1000
   }
 
+  clearCache() {
+    this.cache.clear()
+    this.inFlight.clear()
+  }
+
   normalize(raw: any): NormalizedKeyBundle | null {
     if (!raw || typeof raw !== "object") {
       return null

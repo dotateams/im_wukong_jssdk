@@ -1,6 +1,6 @@
 import type { Channel, ChannelInfo, MediaMessageContent, MessageContent } from "../model";
 import { ChannelTypeGroup, ChannelTypePerson } from "../model";
-import type { E2EEDecryptContext, E2EEInitOptions, E2EESendPlan, ResolveSendPlanOptions } from "./e2ee_types";
+import type { E2EEDecryptContext, E2EEInitOptions, E2EERecoverContext, E2EESendPlan, ResolveSendPlanOptions } from "./e2ee_types";
 import { SignalE2EEAdapter } from "./e2ee_signal_adapter";
 import { SignalProtocolManager } from "../signal/SignalProtocolManager";
 import { E2EEMediaCrypto } from "./e2ee_media";
@@ -174,6 +174,21 @@ export class E2EEManager {
             return this.mediaCrypto.restoreContent(decrypted as any);
         }
         return decrypted;
+    }
+
+    public async recoverDecryptFailure(
+        content: MessageContent,
+        channel: Channel,
+        context?: E2EERecoverContext,
+    ): Promise<boolean> {
+        if (!this.options) {
+            return false;
+        }
+        const adapter = this.options.cryptoAdapter;
+        if (!adapter || !adapter.recoverDecryptFailure) {
+            return false;
+        }
+        return adapter.recoverDecryptFailure(content, channel, context);
     }
 
     public shouldCachePlaintext(content: MessageContent): boolean {

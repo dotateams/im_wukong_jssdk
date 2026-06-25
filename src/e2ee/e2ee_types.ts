@@ -31,9 +31,15 @@ export interface E2EEDecryptContext {
     senderDeviceId?: string | number;
 }
 
+export interface E2EERecoverContext extends E2EEDecryptContext {
+    error?: any;
+    realtime?: boolean;
+}
+
 export interface E2EECryptoAdapter {
     encryptMessage?: (content: MessageContent, channel: Channel) => Promise<MessageContent>;
     decryptMessage?: (content: MessageContent, channel: Channel, context?: E2EEDecryptContext) => Promise<MessageContent>;
+    recoverDecryptFailure?: (content: MessageContent, channel: Channel, context?: E2EERecoverContext) => Promise<boolean>;
     prepareGroupSend?: (channel: Channel) => Promise<void>;
     clearLocalData?: () => Promise<void>;
 }

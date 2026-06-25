@@ -131,6 +131,7 @@ test("e2ee_prekey_manager repairs missing local signed prekey for registered dev
 
 test("e2ee_prekey_manager re-registers when server identity differs from local identity", async () => {
     let uploaded: any = null;
+    let identityRepaired = 0;
     const manager: any = new PreKeyManager({
         uid: "alice",
         deviceId: "alice-web",
@@ -159,6 +160,9 @@ test("e2ee_prekey_manager re-registers when server identity differs from local i
         },
         toBase64: (data: any) => `b64:${data}`,
         ensureWebCrypto: () => undefined,
+        onIdentityRepaired: async () => {
+            identityRepaired++;
+        },
     });
     manager.generatePreKeys = async () => [
         { keyId: 101, keyPair: { pubKey: "prekey-101" } },
@@ -174,6 +178,7 @@ test("e2ee_prekey_manager re-registers when server identity differs from local i
     assert.ok(uploaded, "expected local identity to be re-registered when server identity differs");
     assert.equal(uploaded.identity_key, "b64:identity-pub");
     assert.equal(uploaded.signed_prekey.key_id, 7);
+    assert.equal(identityRepaired, 1);
 });
 
 test("e2ee_prekey_manager uploads complete signed prekey rotation bundle", async () => {
