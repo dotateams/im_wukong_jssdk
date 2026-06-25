@@ -129,6 +129,53 @@ test("e2ee_prekey_manager repairs missing local signed prekey for registered dev
     assert.equal(uploaded.signed_prekey.public_key, "b64:signed-new");
 });
 
+test("e2ee_prekey_manager re-registers when server identity differs from local identity", async () => {
+    let uploaded: any = null;
+    const manager: any = new PreKeyManager({
+        uid: "alice",
+        deviceId: "alice-web",
+        deviceName: "Alice Web",
+        apiClient: {
+            get: async (path: string) => {
+                assert.equal(path, "/e2e/keys/alice/alice-web");
+                return {
+                    uid: "alice",
+                    device_id: "alice-web",
+                    identity_key: "b64:old-identity-pub",
+                    signed_prekey: { key_id: 7, public_key: "server-signed", signature: "server-sig" },
+                };
+            },
+            post: async (_path: string, body: any) => {
+                uploaded = body;
+                return { ok: true };
+            },
+        },
+        store: {
+            init: async () => undefined,
+            getIdentityKeyPair: async () => ({ pubKey: "identity-pub", privKey: "identity-priv" }),
+            getLocalRegistrationId: async () => 33,
+            loadSignedPreKey: async () => ({ pubKey: "signed-pub", privKey: "signed-priv" }),
+            storeSignedPreKey: async () => undefined,
+        },
+        toBase64: (data: any) => `b64:${data}`,
+        ensureWebCrypto: () => undefined,
+    });
+    manager.generatePreKeys = async () => [
+        { keyId: 101, keyPair: { pubKey: "prekey-101" } },
+    ];
+    manager.generateSignedPreKey = async (keyId: any) => ({
+        keyId,
+        keyPair: { pubKey: "signed-new", privKey: "signed-priv" },
+        signature: "signed-sig",
+    });
+
+    await manager.initialize();
+
+    assert.ok(uploaded, "expected local identity to be re-registered when server identity differs");
+    assert.equal(uploaded.identity_key, "b64:identity-pub");
+    assert.equal(uploaded.signed_prekey.key_id, 7);
+});
+
 test("e2ee_prekey_manager uploads complete signed prekey rotation bundle", async () => {
     let uploaded: any = null;
     let storedSignedPreKeyId: any = null;

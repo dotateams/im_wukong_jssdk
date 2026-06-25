@@ -43,6 +43,13 @@ export class PreKeyManager {
       if (!currentDevice.registered) {
         const bundle = await this.generateBundleForExistingIdentity(identityKeyPair)
         await this.uploadPreKeys(bundle)
+      } else if (this.isServerIdentityMismatched(identityKeyPair, currentDevice.identityKey)) {
+        console.warn('[E2EE] local identity differs from server identity, re-registering device keys', {
+          uid: this.uid,
+          deviceId: this.deviceId,
+        })
+        const bundle = await this.generateBundleForExistingIdentity(identityKeyPair, currentDevice.signedPreKeyId)
+        await this.uploadPreKeys(bundle)
       } else if (!(await this.hasLocalSignedPreKey(currentDevice.signedPreKeyId))) {
         const bundle = await this.generateBundleForExistingIdentity(identityKeyPair, currentDevice.signedPreKeyId)
         await this.uploadPreKeys(bundle)
@@ -166,6 +173,7 @@ export class PreKeyManager {
       return {
         registered: true,
         signedPreKeyId: this.getSignedPreKeyIdFromBundle(data) || 1,
+        identityKey: this.getIdentityKeyFromBundle(data),
       }
     } catch (error) {
       const status = error && ((error as any).status || (error as any).response?.status)
@@ -174,6 +182,21 @@ export class PreKeyManager {
       }
       throw error
     }
+  }
+
+  getIdentityKeyFromBundle(bundle: any) {
+    if (!bundle) {
+      return ""
+    }
+    const identityKey = bundle.identity_key ?? bundle.IdentityKey ?? bundle.identityKey
+    return identityKey ? String(identityKey) : ""
+  }
+
+  isServerIdentityMismatched(identityKeyPair: any, serverIdentityKey: any) {
+    if (!identityKeyPair || !identityKeyPair.pubKey || !serverIdentityKey) {
+      return false
+    }
+    return this.toBase64(identityKeyPair.pubKey) !== String(serverIdentityKey)
   }
 
   getSignedPreKeyIdFromBundle(bundle: any) {
