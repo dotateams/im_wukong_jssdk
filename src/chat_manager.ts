@@ -207,12 +207,6 @@ export class ChatManager {
             }
         }
         this.debugE2EEDecrypt("before", message, message.content)
-        if (this.isRecentE2EEDecryptFailure(message, signalContent)) {
-            ;(message as any).e2eeDecryptFailed = true
-            ;(message as any).e2eeDecryptError = new Error("Missing sender key")
-            message.content = this.buildE2EEDecryptFailureContent((message as any).e2eeDecryptError)
-            return
-        }
         try {
             message.content = await WKSDK.shared().config.e2ee.decryptMessage(message.content, message.channel, {
                 message,
@@ -358,22 +352,6 @@ export class ChatManager {
         const lastFailedAt = this.e2eeDecryptFailureMemoryCache.get(key)
         this.e2eeDecryptFailureMemoryCache.set(key, now)
         return !lastFailedAt || now - lastFailedAt > this.e2eeDecryptFailureTTL
-    }
-
-    private isRecentE2EEDecryptFailure(message: Message, signalContent: MessageContent | any): boolean {
-        const key = this.e2eeDecryptFailureCacheKey(message, signalContent)
-        if (!key) {
-            return false
-        }
-        const failedAt = this.e2eeDecryptFailureMemoryCache.get(key)
-        if (!failedAt) {
-            return false
-        }
-        if (Date.now() - failedAt > this.e2eeDecryptFailureTTL) {
-            this.e2eeDecryptFailureMemoryCache.delete(key)
-            return false
-        }
-        return true
     }
 
     private e2eeDecryptFailureCacheKey(message: Message, signalContent: MessageContent | any): string {
