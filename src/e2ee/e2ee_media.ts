@@ -87,7 +87,39 @@ export class E2EEMediaCrypto {
         encrypted.name = this.fileNameOf(sourceFile)
         encrypted.original = originalPart
         encrypted.thumb = thumbPart
+        this.attachLocalEncryptedMedia(content, encrypted, sourceFile)
         return encrypted
+    }
+
+    private attachLocalEncryptedMedia(content: MediaMessageContent, encrypted: MessageEncryptedMedia, sourceFile: File): void {
+        const localContent = content as any
+        const displayUrl = this.localDisplayUrlFor(encrypted, sourceFile)
+        if ("url" in localContent) {
+            localContent.url = displayUrl
+        }
+        content.remoteUrl = displayUrl
+        if (!localContent.name) {
+            localContent.name = encrypted.name || this.fileNameOf(sourceFile)
+        }
+        if (!localContent.size) {
+            localContent.size = encrypted.original?.size || (sourceFile as any).size || 0
+        }
+        localContent.e2eeMedia = {
+            version: encrypted.version,
+            mediaKind: encrypted.mediaKind,
+            originalContentType: encrypted.originalContentType,
+            original: encrypted.original,
+            thumb: encrypted.thumb,
+            displayUrl,
+        }
+        content.file = undefined
+    }
+
+    private localDisplayUrlFor(encrypted: MessageEncryptedMedia, sourceFile: File): string {
+        if (!encrypted.thumb) {
+            return ""
+        }
+        return this.createObjectURL(sourceFile as any as Blob)
     }
 
     public async restoreContent(content: MessageEncryptedMedia): Promise<MessageContent> {

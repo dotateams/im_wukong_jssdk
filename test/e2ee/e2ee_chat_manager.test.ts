@@ -278,6 +278,45 @@ test("e2ee_chat_manager encrypts media messages in enabled channels", async () =
     assert.equal(mediaStore.size, 2);
 });
 
+test("e2ee_chat_manager annotates self-sent encrypted files as downloadable", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: {
+            ...installMediaProvider(mediaStore),
+            createThumbnail: async () => undefined,
+        },
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                const signal = signalContent("signal_file");
+                signal.realContentType = MessageContentType.encryptedMedia;
+                return signal;
+            },
+        },
+    });
+
+    const file = new TestFileContent(testFile(["hello file"], "credentials.json", "application/json"), "credentials.json", 10);
+    const finalContent = await sdk.chatManager.prepareContentForSend(file, channel);
+
+    assert.ok(finalContent instanceof MessageSignalContent);
+    assert.ok(encryptedMediaPayload);
+    assert.equal(encryptedMediaPayload!.originalContentType, TestFileContentType);
+    assert.equal((file as any).file, undefined);
+    assert.equal(file.remoteUrl, "");
+    assert.equal(file.url, "");
+    assert.equal((file as any).e2eeMedia.mediaKind, "media");
+    assert.ok((file as any).e2eeMedia.original.url);
+    assert.equal((file as any).e2eeMedia.original.url, encryptedMediaPayload!.original.url);
+    assert.equal(mediaStore.size, 1);
+});
+
 test("e2ee_chat_manager decrypts encrypted media to displayable content", async () => {
     const sdk = resetSdk();
     const channel = new Channel("receiver", ChannelTypePerson);
