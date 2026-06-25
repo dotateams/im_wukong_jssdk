@@ -162,6 +162,22 @@ export class E2EEMediaCrypto {
         return media.originalBlobUrl
     }
 
+    public async loadThumbnail(content: MessageContent | any): Promise<string | undefined> {
+        const media = content && content.e2eeMedia
+        if (!media) {
+            return undefined
+        }
+        if (media.displayUrl) {
+            return media.displayUrl
+        }
+        if (media.thumb) {
+            const blob = await this.decryptCachedThumbnailPart(media as MessageEncryptedMedia, media.thumb)
+            media.displayUrl = this.createObjectURL(blob)
+            return media.displayUrl
+        }
+        return this.loadOriginal(content)
+    }
+
     public clearLocalData(): void {
         const storage = this.getLocalStorage()
         const scope = this.cacheScope ? this.cacheScope() : {}

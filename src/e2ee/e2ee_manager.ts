@@ -198,6 +198,13 @@ export class E2EEManager {
         return this.mediaCrypto.loadOriginal(content as any);
     }
 
+    public async loadMediaThumbnail(content: MessageContent): Promise<string | undefined> {
+        if (!this.mediaCrypto) {
+            return undefined;
+        }
+        return this.mediaCrypto.loadThumbnail(content as any);
+    }
+
     private clearPlaintextStorage(uid: string, deviceId: string): void {
         const prefix = `wk_e2ee_plaintext:${uid}:${deviceId}:`;
         for (const storage of [this.getStorage("sessionStorage"), this.getStorage("localStorage")]) {
