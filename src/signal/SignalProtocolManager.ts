@@ -323,6 +323,22 @@ export class SignalProtocolManager {
     return this.getResponseData(resp)
   }
 
+  async requestGroupSenderKeyRepair(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    const resp = await this.apiClient.post('/e2e/group_sender_keys/repair_requests', payload)
+    return this.getResponseData(resp)
+  }
+
+  async lookupGroupSenderKeyRepairRequests(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    const resp = await this.apiClient.post('/e2e/group_sender_keys/repair_requests/pending', payload)
+    return this.getResponseData(resp)
+  }
+
   normalizeMemberHash(memberHash: any, members: any) {
     return this.groupManager.normalizeMemberHash(memberHash, members)
   }

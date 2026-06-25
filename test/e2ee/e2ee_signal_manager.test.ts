@@ -539,6 +539,138 @@ test("group manager prepareGroupSend uploads envelopes without advancing sender 
     assert.equal(record.getState().messageIndex, 0);
 });
 
+test("group manager requests targeted sender key repair when envelope recovery fails", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-web";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    let repairPayload: any = null;
+
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => {
+            throw new Error("not found");
+        },
+        requestGroupSenderKeyRepair: async (payload: any) => {
+            repairPayload = payload;
+        },
+    };
+
+    const recovered = await manager.recoverSenderKeyFromEnvelope(
+        { group_id: "group-1", key_id: 9 },
+        "alice",
+        "alice-web",
+    );
+
+    assert.equal(recovered, false);
+    assert.deepEqual(repairPayload, {
+        group_id: "group-1",
+        sender_uid: "alice",
+        sender_device_id: "alice-web",
+        key_id: 9,
+        recipient_uid: "bob",
+        recipient_device_id: "bob-web",
+        reason: "missing_sender_key",
+    });
+});
+
+test("group manager requests targeted sender key repair when envelope lookup returns empty", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-web";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    let repairPayload: any = null;
+
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => ({}),
+        requestGroupSenderKeyRepair: async (payload: any) => {
+            repairPayload = payload;
+        },
+    };
+
+    const recovered = await manager.recoverSenderKeyFromEnvelope(
+        { group_id: "group-1", key_id: 9 },
+        "alice",
+        "alice-web",
+    );
+
+    assert.equal(recovered, false);
+    assert.deepEqual(repairPayload, {
+        group_id: "group-1",
+        sender_uid: "alice",
+        sender_device_id: "alice-web",
+        key_id: 9,
+        recipient_uid: "bob",
+        recipient_device_id: "bob-web",
+        reason: "missing_sender_key",
+    });
+});
+
+test("group manager prepareGroupSend uploads sender key only to pending repair devices", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+    manager.groupEncryptionLocks = new Map();
+
+    const record = new SenderKeyRecord({
+        memberHash: "members-v2",
+        states: [
+            new SenderKeyState({
+                keyId: 9,
+                senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                chainKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                signingPubKey: "pub",
+                signingPrivKey: "priv",
+                messageIndex: 8,
+                skipped: {},
+                kdfVersion: "v2",
+            }),
+        ],
+    });
+    let builtMembers: any[] = [];
+    let uploaded = 0;
+
+    manager.parent = {
+        lookupGroupSenderKeyRepairRequests: async () => ({
+            requests: [
+                { recipient_uid: "bob", recipient_device_id: "bob-web" },
+                { recipient_uid: "bob", recipient_device_id: "bob-phone" },
+            ],
+        }),
+    };
+    manager.normalizeMemberHash = () => "members-v2";
+    manager.loadSenderKeyRecord = async () => record;
+    manager.buildDistributionPayloadForRecord = async (_groupId: string, _record: any, members: any[]) => {
+        builtMembers = members;
+        return {
+            key_id: 9,
+            member_hash: "members-v2",
+            distribution: {
+                ciphertexts: members.flatMap((member: any) =>
+                    member.devices.map((device: any) => ({
+                        uid: member.uid,
+                        device_id: device.device_id,
+                        enc: "aes-256-gcm",
+                        body: "key",
+                    })),
+                ),
+            },
+        };
+    };
+    manager.uploadDistributionEnvelopes = async () => {
+        uploaded += 1;
+    };
+    manager.logPerf = () => undefined;
+
+    await manager.prepareGroupSend("group-1", [
+        { uid: "bob", devices: [{ device_id: "bob-web" }, { device_id: "bob-phone" }] },
+        { uid: "carol", devices: [{ device_id: "carol-web" }] },
+    ], "members-v2");
+
+    assert.deepEqual(builtMembers, [{ uid: "bob", devices: [{ device_id: "bob-web" }, { device_id: "bob-phone" }] }]);
+    assert.equal(uploaded, 1);
+    assert.equal(record.getState().messageIndex, 8);
+});
+
 test("group manager prepareGroupSend waits for active group encryption lock", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";

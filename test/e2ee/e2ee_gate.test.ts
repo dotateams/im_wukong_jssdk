@@ -66,6 +66,50 @@ test("e2ee_gate initialization requires uid and deviceId", async () => {
     );
 });
 
+test("e2ee_gate plaintext cleanup preserves Signal keys", async () => {
+    const manager = new E2EEManager();
+    let signalCleared = false;
+    const oldLocalStorage = (globalThis as any).localStorage;
+    const oldSessionStorage = (globalThis as any).sessionStorage;
+    const storageData: Record<string, string> = {
+        "wk_e2ee_plaintext:u1:web-device-1:group-1:1": "cached",
+        "wk_e2ee_plaintext:u1:other-device:group-1:1": "keep-other-device",
+    };
+    const storage = {
+        get length() {
+            return Object.keys(storageData).length;
+        },
+        key: (index: number) => Object.keys(storageData)[index] || null,
+        removeItem: (key: string) => {
+            delete storageData[key];
+        },
+    };
+
+    (globalThis as any).localStorage = storage;
+    (globalThis as any).sessionStorage = storage;
+
+    try {
+        await manager.initialize({
+            uid: "u1",
+            deviceId: "web-device-1",
+            cryptoAdapter: {
+                clearLocalData: async () => {
+                    signalCleared = true;
+                },
+            } as any,
+        });
+
+        await manager.clearLocalPlaintextData();
+
+        assert.equal(signalCleared, false);
+        assert.equal(storageData["wk_e2ee_plaintext:u1:web-device-1:group-1:1"], undefined);
+        assert.equal(storageData["wk_e2ee_plaintext:u1:other-device:group-1:1"], "keep-other-device");
+    } finally {
+        (globalThis as any).localStorage = oldLocalStorage;
+        (globalThis as any).sessionStorage = oldSessionStorage;
+    }
+});
+
 test("e2ee_gate explicit disabled channel sends plaintext", async () => {
     const manager = new E2EEManager();
     const channel = new Channel("u2", ChannelTypePerson);

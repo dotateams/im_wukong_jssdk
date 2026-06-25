@@ -44,7 +44,7 @@ export class E2EEManager {
         this.mediaCrypto = undefined;
     }
 
-    public async clearLocalData(): Promise<void> {
+    public async clearLocalPlaintextData(): Promise<void> {
         const options = this.options;
         if (!options) {
             return;
@@ -53,6 +53,14 @@ export class E2EEManager {
         if (this.mediaCrypto && typeof (this.mediaCrypto as any).clearLocalData === "function") {
             ;(this.mediaCrypto as any).clearLocalData();
         }
+    }
+
+    public async clearLocalData(): Promise<void> {
+        const options = this.options;
+        if (!options) {
+            return;
+        }
+        await this.clearLocalPlaintextData();
         const adapter: any = options.cryptoAdapter as any;
         if (adapter && typeof adapter.clearLocalData === "function") {
             await adapter.clearLocalData();

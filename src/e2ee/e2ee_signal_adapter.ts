@@ -16,6 +16,8 @@ export interface SignalLikeManager {
     decryptMessage(uid: string, deviceId: string | number, messageType: any, ciphertext: any): Promise<string>;
     encryptGroupMessage?(groupId: string, plaintext: string, members?: any, memberHash?: any): Promise<any>;
     prepareGroupSend?(groupId: string, members?: any, memberHash?: any): Promise<any>;
+    requestGroupSenderKeyRepair?(payload: any): Promise<any>;
+    lookupGroupSenderKeyRepairRequests?(payload: any): Promise<any>;
 }
 
 export interface SignalE2EEAdapterOptions {

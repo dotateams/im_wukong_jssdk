@@ -22,6 +22,7 @@ export class GroupManager {
   private senderKeyEnvelopeUploadCache: SmartLRUCache<string, boolean>;
   private senderKeyEnvelopeUploadPromises: Map<string, Promise<void>>;
   private senderKeyEnvelopeMissingCache: SmartLRUCache<string, boolean>;
+  private senderKeyRepairRequestCache: SmartLRUCache<string, boolean>;
   private readonly senderKeyDistributionRetryWindow = 1;
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
@@ -58,6 +59,10 @@ export class GroupManager {
     this.senderKeyEnvelopeMissingCache = new SmartLRUCache({
       maxSize: 5000,
       ttlMs: 60 * 1000,
+    });
+    this.senderKeyRepairRequestCache = new SmartLRUCache({
+      maxSize: 5000,
+      ttlMs: 30 * 1000,
     });
   }
 
@@ -255,11 +260,16 @@ export class GroupManager {
       const loadMs = this.now() - loadStartedAt;
       const shouldDistribute = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
       if (!shouldDistribute) {
+        const repairStartedAt = this.now();
+        const repairCount = await this.uploadPendingRepairEnvelopes(groupId, record, normalizedMemberHash);
+        const repairMs = this.now() - repairStartedAt;
         this.logPerf('prepareGroupSend', {
           groupId,
           memberCount: Array.isArray(members) ? members.length : 0,
           cacheHit: true,
+          repairCount,
           loadMs,
+          repairMs,
           totalMs: this.now() - startedAt,
         });
         return true;
@@ -424,6 +434,109 @@ export class GroupManager {
         this.senderKeyEnvelopeUploadPromises.delete(uploadCacheKey);
       }
     }
+  }
+
+  async uploadPendingRepairEnvelopes(groupId: any, record: any, memberHash: string): Promise<number> {
+    if (!this.parent || typeof this.parent.lookupGroupSenderKeyRepairRequests !== 'function') {
+      return 0;
+    }
+    const state = record && typeof record.getState === 'function' ? record.getState() : null;
+    if (!groupId || !state || !state.keyId) {
+      return 0;
+    }
+    const cacheKey = this.getSenderKeyRepairRequestCacheKey(groupId, state.keyId);
+    const cache = this.getSenderKeyRepairRequestCache();
+    if (cache.has(cacheKey)) {
+      return 0;
+    }
+    let resp: any;
+    try {
+      resp = await this.parent.lookupGroupSenderKeyRepairRequests({
+        group_id: groupId,
+        sender_uid: this.uid,
+        sender_device_id: this.deviceId,
+        key_id: state.keyId,
+        limit: 100,
+      });
+    } catch (error) {
+      const config = E2EEConfigManager.getInstance().getConfig();
+      if (config.debugEnabled || config.verboseLogging) {
+        console.warn('[GroupManager] lookup sender key repair requests failed', error);
+      }
+      return 0;
+    }
+    const requests = this.normalizeRepairRequests(resp);
+    if (requests.length === 0) {
+      cache.set(cacheKey, true);
+      return 0;
+    }
+    const members = this.repairRequestsToMembers(requests);
+    if (members.length === 0) {
+      cache.set(cacheKey, true);
+      return 0;
+    }
+    const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, memberHash || record.memberHash || '');
+    if (!distribution) {
+      cache.set(cacheKey, true);
+      return 0;
+    }
+    await this.uploadDistributionEnvelopes(groupId, distribution);
+    cache.set(cacheKey, true);
+    return members.reduce((total, member) => total + this.normalizeMemberDeviceIds(member).length, 0);
+  }
+
+  private normalizeRepairRequests(resp: any): any[] {
+    const raw =
+      Array.isArray(resp) ? resp :
+      Array.isArray(resp?.requests) ? resp.requests :
+      Array.isArray(resp?.data?.requests) ? resp.data.requests :
+      Array.isArray(resp?.data) ? resp.data :
+      [];
+    const dedup = new Map<string, any>();
+    for (const item of raw) {
+      const uid = item?.recipient_uid ?? item?.recipientUid ?? item?.uid;
+      const deviceId = item?.recipient_device_id ?? item?.recipientDeviceId ?? item?.device_id ?? item?.deviceId;
+      if (!uid || deviceId === undefined || deviceId === null || deviceId === '') {
+        continue;
+      }
+      dedup.set(`${uid}:${deviceId}`, {
+        uid,
+        device_id: String(deviceId),
+      });
+    }
+    return Array.from(dedup.values());
+  }
+
+  private repairRequestsToMembers(requests: any[]): any[] {
+    const byUid = new Map<string, any[]>();
+    for (const request of requests) {
+      const uid = request.uid ?? request.recipient_uid ?? request.recipientUid;
+      const deviceId = request.device_id ?? request.deviceId ?? request.recipient_device_id ?? request.recipientDeviceId;
+      if (!uid || deviceId === undefined || deviceId === null || deviceId === '') {
+        continue;
+      }
+      const devices = byUid.get(uid) || [];
+      devices.push({ device_id: String(deviceId) });
+      byUid.set(uid, devices);
+    }
+    return Array.from(byUid.entries()).map(([uid, devices]) => ({
+      uid,
+      devices,
+    }));
+  }
+
+  private getSenderKeyRepairRequestCacheKey(groupId: any, keyId: any): string {
+    return `repair:${groupId}:${this.uid}:${this.deviceId}:${keyId}`;
+  }
+
+  private getSenderKeyRepairRequestCache(): SmartLRUCache<string, boolean> {
+    if (!this.senderKeyRepairRequestCache) {
+      this.senderKeyRepairRequestCache = new SmartLRUCache({
+        maxSize: 5000,
+        ttlMs: 30 * 1000,
+      });
+    }
+    return this.senderKeyRepairRequestCache;
   }
 
   private getSenderKeyEnvelopeUploadCache(): SmartLRUCache<string, boolean> {
@@ -758,7 +871,22 @@ export class GroupManager {
     if (existing) {
       return existing;
     }
+    const repairPayload = {
+      group_id: groupId,
+      sender_uid: senderUid,
+      sender_device_id: senderDeviceId,
+      key_id: keyId,
+      recipient_uid: this.uid,
+      recipient_device_id: this.deviceId,
+      reason: 'missing_sender_key',
+    };
     const promise = this.doRecoverSenderKeyFromEnvelope(groupId, senderUid, senderDeviceId, keyId)
+      .then(async (recovered) => {
+        if (!recovered) {
+          await this.requestSenderKeyRepair(repairPayload);
+        }
+        return recovered;
+      })
       .catch((error) => {
         if (this.isPermanentEnvelopeLookupError(error)) {
           this.getSenderKeyEnvelopeMissingCache().set(recoveryKey, true);
@@ -767,13 +895,33 @@ export class GroupManager {
         if (config.debugEnabled || config.verboseLogging) {
           console.warn('[GroupManager] recover sender key envelope failed', error);
         }
-        return false;
+        return this.requestSenderKeyRepair(repairPayload).then(() => false);
       })
       .finally(() => {
         this.groupEnvelopeRecoveryPromises.delete(recoveryKey);
       });
     this.groupEnvelopeRecoveryPromises.set(recoveryKey, promise);
     return promise;
+  }
+
+  private async requestSenderKeyRepair(payload: any): Promise<void> {
+    if (!this.parent || typeof this.parent.requestGroupSenderKeyRepair !== 'function') {
+      return;
+    }
+    const cacheKey = `request:${payload.group_id}:${payload.sender_uid}:${payload.sender_device_id}:${payload.key_id}:${payload.recipient_uid}:${payload.recipient_device_id}`;
+    const missingCache = this.getSenderKeyEnvelopeMissingCache();
+    if (missingCache.get(cacheKey)) {
+      return;
+    }
+    missingCache.set(cacheKey, true);
+    try {
+      await this.parent.requestGroupSenderKeyRepair(payload);
+    } catch (error) {
+      const config = E2EEConfigManager.getInstance().getConfig();
+      if (config.debugEnabled || config.verboseLogging) {
+        console.warn('[GroupManager] request sender key repair failed', error);
+      }
+    }
   }
 
   private getSenderKeyEnvelopeMissingCache(): SmartLRUCache<string, boolean> {
