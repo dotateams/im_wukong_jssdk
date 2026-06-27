@@ -43,6 +43,21 @@ export class E2EEMediaCrypto {
         return !!(content && content.e2eeMedia)
     }
 
+    public toEncryptedMediaContent(content: MessageContent | any): MessageEncryptedMedia | undefined {
+        const media = content && content.e2eeMedia
+        if (!media || !media.original) {
+            return undefined
+        }
+        const encrypted = new MessageEncryptedMedia()
+        encrypted.version = Number(media.version || 1)
+        encrypted.mediaKind = media.mediaKind || ""
+        encrypted.originalContentType = Number(media.originalContentType || content.contentType || 0)
+        encrypted.name = content.name || ""
+        encrypted.original = media.original
+        encrypted.thumb = media.thumb
+        return encrypted
+    }
+
     public async encryptContent(content: MediaMessageContent, channel: Channel): Promise<MessageEncryptedMedia> {
         const sourceFile = content.file
         if (!sourceFile) {

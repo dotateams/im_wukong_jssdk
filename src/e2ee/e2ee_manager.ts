@@ -191,15 +191,33 @@ export class E2EEManager {
         return adapter.recoverDecryptFailure(content, channel, context);
     }
 
-    public shouldCachePlaintext(content: MessageContent): boolean {
+    public shouldCachePlaintext(content: MessageContent, channel?: Channel): boolean {
         if (!this.mediaCrypto) {
             return true;
         }
-        return !this.mediaCrypto.canEncrypt(content) &&
-            !this.mediaCrypto.isRestoredMedia(content);
+        if (this.mediaCrypto.isRestoredMedia(content)) {
+            if (channel && channel.channelType !== ChannelTypePerson) {
+                return false;
+            }
+            return !!this.mediaCrypto.toEncryptedMediaContent(content);
+        }
+        return !this.mediaCrypto.canEncrypt(content);
     }
 
-    public async restoreCachedPlaintext(content: MessageContent): Promise<MessageContent> {
+    public cacheablePlaintextContent(content: MessageContent, channel?: Channel): MessageContent | undefined {
+        if (!this.mediaCrypto) {
+            return content;
+        }
+        if (this.mediaCrypto.isRestoredMedia(content)) {
+            if (channel && channel.channelType !== ChannelTypePerson) {
+                return undefined;
+            }
+            return this.mediaCrypto.toEncryptedMediaContent(content);
+        }
+        return content;
+    }
+
+    public async restoreCachedPlaintext(content: MessageContent, channel?: Channel): Promise<MessageContent> {
         if (this.mediaCrypto && this.mediaCrypto.isEncryptedMedia(content)) {
             return this.mediaCrypto.restoreContent(content as any);
         }

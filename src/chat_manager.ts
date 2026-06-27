@@ -192,7 +192,7 @@ export class ChatManager {
         const cachedContent = this.restoreCachedE2EEPlaintext(message, signalContent)
         if (cachedContent) {
             try {
-                message.content = await WKSDK.shared().config.e2ee.restoreCachedPlaintext(cachedContent)
+                message.content = await WKSDK.shared().config.e2ee.restoreCachedPlaintext(cachedContent, message.channel)
                 ;(message as any).e2eeDecryptFailed = false
                 this.debugE2EEDecrypt("cache", message, message.content)
                 return
@@ -327,7 +327,14 @@ export class ChatManager {
         if (!plaintextContent) {
             return
         }
-        if (WKSDK.shared().config.e2ee && !WKSDK.shared().config.e2ee.shouldCachePlaintext(plaintextContent)) {
+        const e2ee = WKSDK.shared().config.e2ee
+        const cacheContent = e2ee && typeof (e2ee as any).cacheablePlaintextContent === "function"
+            ? (e2ee as any).cacheablePlaintextContent(plaintextContent, message.channel)
+            : plaintextContent
+        if (!cacheContent) {
+            return
+        }
+        if (e2ee && !e2ee.shouldCachePlaintext(cacheContent, message.channel)) {
             return
         }
         const keys = this.e2eePlaintextCacheKeys(message, signalContent)
@@ -335,10 +342,10 @@ export class ChatManager {
             return
         }
         try {
-            const payload = plaintextContent.encodeJSON ? plaintextContent.encodeJSON() : {}
+            const payload = this.encodeContentPayload(cacheContent)
             const now = Date.now()
             const value = JSON.stringify({
-                type: plaintextContent.contentType,
+                type: cacheContent.contentType,
                 payload,
                 cachedAt: now,
             })
@@ -352,6 +359,36 @@ export class ChatManager {
                 console.warn("[E2EE] plaintext cache write failed", error)
             }
         }
+    }
+
+    private encodeContentPayload(content: MessageContent | any): any {
+        if (!content) {
+            return {}
+        }
+        if (typeof content.encode === "function") {
+            try {
+                const payload = JSON.parse(this.uint8ArrayToString(content.encode()))
+                if (payload && typeof payload === "object") {
+                    return payload
+                }
+            } catch (_error) {
+                // Fallback to encodeJSON below.
+            }
+        }
+        const payload = content.encodeJSON ? content.encodeJSON() : {}
+        if (payload.type === undefined) {
+            payload.type = content.contentType
+        }
+        if (!payload.content && (content.text || content.conversationDigest)) {
+            payload.content = content.text || content.conversationDigest
+        }
+        if (!payload.reply && content.contentObj && content.contentObj.reply) {
+            payload.reply = content.contentObj.reply
+        }
+        if (!payload.mention && content.contentObj && content.contentObj.mention) {
+            payload.mention = content.contentObj.mention
+        }
+        return payload
     }
 
     restoreCachedE2EEPlaintext(message: Message, signalContent: MessageContent | any): MessageContent | undefined {
@@ -479,6 +516,16 @@ export class ChatManager {
             arr.push(newStr.charCodeAt(i))
         }
         return new Uint8Array(arr)
+    }
+
+    uint8ArrayToString(data: Uint8Array): string {
+        const chunkSize = 0x8000
+        const parts: string[] = []
+        for (let offset = 0; offset < data.length; offset += chunkSize) {
+            const chunk = data.subarray(offset, offset + chunkSize)
+            parts.push(String.fromCharCode(...Array.from(chunk)))
+        }
+        return decodeURIComponent(escape(parts.join("")))
     }
 
     debugRawReceivedMessage(message: Message) {

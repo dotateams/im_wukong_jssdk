@@ -12,6 +12,7 @@ import {
     MessageImage,
     MessageSignalContent,
     MessageText,
+    Reply,
 } from "../../src/model";
 import { MessageContentType } from "../../src/const";
 import { E2EEMediaCrypto } from "../../src/e2ee/e2ee_media";
@@ -360,6 +361,140 @@ test("e2ee_chat_manager decrypts encrypted media to displayable content", async 
     assert.ok(originalURL && originalURL.indexOf("blob:") === 0);
 });
 
+test("e2ee_chat_manager restores received person encrypted media from cache without reusing signal message keys", async () => {
+    installStorageMock("localStorage");
+    installStorageMock("sessionStorage");
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    let fetchCount = 0;
+    const provider = {
+        ...installMediaProvider(mediaStore),
+        fetchEncryptedMedia: async (url: string) => {
+            fetchCount++;
+            const blob = mediaStore.get(url);
+            if (!blob) {
+                throw new Error(`missing encrypted blob ${url}`);
+            }
+            return blob;
+        },
+    };
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+    let decryptCalls = 0;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: provider,
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                const signal = signalContent("signal_person_media");
+                signal.realContentType = MessageContentType.encryptedMedia;
+                return signal;
+            },
+            decryptMessage: async () => {
+                decryptCalls += 1;
+                if (decryptCalls > 1) {
+                    throw new Error("person signal message key was reused");
+                }
+                return encryptedMediaPayload!;
+            },
+        },
+    });
+
+    const image = new MessageImage(testFile(["hello image"], "hello.png", "image/png"), 640, 480);
+    await sdk.chatManager.prepareContentForSend(image, channel);
+    assert.ok(encryptedMediaPayload);
+
+    const realtime = new Message();
+    realtime.channel = channel;
+    realtime.fromUID = "receiver";
+    realtime.clientMsgNo = "person-media-client-no";
+    realtime.messageID = "person-media-message-id";
+    realtime.content = signalContent("signal_person_media");
+    (realtime.content as MessageSignalContent).realContentType = MessageContentType.encryptedMedia;
+
+    await sdk.chatManager.decryptMessageIfNeeded(realtime, { realtime: true });
+
+    assert.equal(realtime.content.contentType, MessageContentType.image);
+
+    const history = new Message();
+    history.channel = channel;
+    history.fromUID = "receiver";
+    history.clientMsgNo = realtime.clientMsgNo;
+    history.messageID = realtime.messageID;
+    history.content = signalContent("signal_person_media");
+    (history.content as MessageSignalContent).realContentType = MessageContentType.encryptedMedia;
+
+    await sdk.chatManager.decryptMessageIfNeeded(history);
+
+    assert.equal(decryptCalls, 1);
+    assert.equal(fetchCount, 1);
+    assert.equal(history.content.contentType, MessageContentType.image);
+    assert.equal((history.content as any).e2eeMedia.mediaKind, "image");
+});
+
+test("e2ee_chat_manager keeps group media out of plaintext cache without changing thumbnail cache", async () => {
+    installStorageMock("localStorage");
+    installStorageMock("sessionStorage");
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    let fetchCount = 0;
+    const provider = {
+        ...installMediaProvider(mediaStore),
+        fetchEncryptedMedia: async (url: string) => {
+            fetchCount++;
+            const blob = mediaStore.get(url);
+            if (!blob) {
+                throw new Error(`missing encrypted blob ${url}`);
+            }
+            return blob;
+        },
+    };
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+    let decryptCalls = 0;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: provider,
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                const signal = signalContent("signal_group_media");
+                signal.realContentType = MessageContentType.encryptedMedia;
+                return signal;
+            },
+            decryptMessage: async () => {
+                decryptCalls++;
+                return encryptedMediaPayload!;
+            },
+        },
+    });
+
+    const image = new MessageImage(testFile(["hello group image"], "group.png", "image/png"), 640, 480);
+    await sdk.chatManager.prepareContentForSend(image, channel);
+    assert.ok(encryptedMediaPayload);
+
+    for (const clientMsgNo of ["group-media-1", "group-media-2"]) {
+        const message = new Message();
+        message.channel = channel;
+        message.fromUID = "receiver";
+        message.clientMsgNo = clientMsgNo;
+        message.content = signalContent("signal_group_media");
+        (message.content as MessageSignalContent).realContentType = MessageContentType.encryptedMedia;
+        await sdk.chatManager.decryptMessageIfNeeded(message);
+        assert.equal(message.content.contentType, MessageContentType.image);
+    }
+
+    assert.equal(decryptCalls, 2);
+    assert.equal(fetchCount, 1);
+});
+
 test("e2ee_chat_manager restores self-sent encrypted media history from metadata cache", async () => {
     installStorageMock("localStorage");
     installStorageMock("sessionStorage");
@@ -537,7 +672,10 @@ test("e2ee_chat_manager falls back to signal decrypt when cached encrypted media
     assert.equal((message as any).e2eeDecryptFailed, false);
     assert.equal(message.content.contentType, MessageContentType.image);
     assert.ok(((message.content as any).url || "").indexOf("blob:") === 0);
-    assert.equal(localStore.has(cacheKey), false);
+    assert.equal(localStore.has(cacheKey), true);
+    const refreshedCache = JSON.parse(localStore.get(cacheKey)!);
+    assert.equal(refreshedCache.type, MessageContentType.encryptedMedia);
+    assert.equal(refreshedCache.payload.original.url, encryptedMediaPayload!.original.url);
 });
 
 test("e2ee_chat_manager suppresses repeated missing sender key errors for the same history message", async () => {
@@ -879,6 +1017,65 @@ test("e2ee_chat_manager restores repeated history ciphertext from plaintext cach
     assert.ok(replay.content instanceof MessageText);
     assert.equal((replay.content as MessageText).text, "cached plaintext");
     assert.equal((replay as any).e2eeDecryptFailed, false);
+});
+
+test("e2ee_chat_manager plaintext cache preserves reply metadata", async () => {
+    const sessionCache = installStorageMock("sessionStorage");
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    const reply = new Reply();
+    reply.messageID = "quoted-message";
+    reply.messageSeq = 42;
+    reply.fromUID = "quoted-user";
+    reply.fromName = "Quoted User";
+    reply.content = new MessageText("quoted text");
+    const decrypted = new MessageText("answer text");
+    decrypted.reply = reply;
+
+    const first = new Message();
+    first.messageID = "reply-msg-1";
+    first.clientMsgNo = "reply-client-1";
+    first.channel = channel;
+    first.fromUID = "receiver";
+    first.content = signalContent("signal_multi");
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => decrypted,
+        },
+    });
+
+    await sdk.chatManager.decryptMessageIfNeeded(first);
+    assert.equal((first.content as MessageText).reply?.fromName, "Quoted User");
+    (sdk.chatManager as any).e2eePlaintextMemoryCache.clear();
+    assert.ok([...sessionCache.keys()].some((key) => key.includes("wk_e2ee_plaintext:sender:web-device-1:ct:")));
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                throw new Error("plaintext cache should be used");
+            },
+        },
+    });
+
+    const replay = new Message();
+    replay.messageID = "reply-msg-1";
+    replay.clientMsgNo = "reply-client-1";
+    replay.channel = channel;
+    replay.fromUID = "receiver";
+    replay.content = signalContent("signal_multi");
+
+    await sdk.chatManager.decryptMessageIfNeeded(replay);
+
+    const restored = replay.content as MessageText;
+    assert.equal(restored.text, "answer text");
+    assert.equal(restored.reply?.messageID, "quoted-message");
+    assert.equal(restored.reply?.fromName, "Quoted User");
+    assert.equal((restored.reply?.content as MessageText).text, "quoted text");
 });
 
 test("e2ee_chat_manager restores self-sent ciphertext after session cache is cleared", async () => {
