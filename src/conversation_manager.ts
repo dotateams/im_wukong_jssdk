@@ -140,6 +140,26 @@ export class ConversationManager {
         }
     }
 
+    private isPageActiveForOpenConversation() {
+        if (typeof document === "undefined") {
+            return true
+        }
+        if (typeof document.hasFocus !== "function") {
+            return document.visibilityState === 'visible'
+        }
+        return document.visibilityState === 'visible' && document.hasFocus()
+    }
+
+    private shouldCountUnread(message: Message) {
+        if (message.send || !message.header.reddot) {
+            return false
+        }
+        if (!this.openConversation || !this.openConversation.channel.isEqual(message.channel)) {
+            return true
+        }
+        return !this.isPageActiveForOpenConversation()
+    }
+
     updateOrAddConversation(message: Message) {
         const conversation = this.findConversation(message.channel)
         let add = false
@@ -150,14 +170,14 @@ export class ConversationManager {
             newConversation.unread = 0
             newConversation.channel = message.channel
             newConversation.timestamp = message.timestamp
-            if (!message.send && message.header.reddot && (!this.openConversation || !this.openConversation.channel.isEqual(message.channel))) {
+            if (this.shouldCountUnread(message)) {
                 newConversation.unread++
             }
             newConversation.lastMessage = message
             this.conversations = [newConversation, ...this.conversations]
             this.notifyConversationListeners(newConversation, ConversationAction.add)
         } else {
-            if (!message.send && message.header.reddot && (!this.openConversation || !this.openConversation.channel.isEqual(message.channel))) {
+            if (this.shouldCountUnread(message)) {
                 conversation.unread++
             }
             conversation.timestamp = message.timestamp
