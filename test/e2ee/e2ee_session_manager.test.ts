@@ -118,4 +118,12 @@ test("e2ee_session_manager retries only recoverable prekey base-key session erro
         manager.isRecoverablePreKeySessionError(3, "Missing Signed PreKey for PreKeyWhisperMessage"),
         false,
     );
+    assert.equal(
+        manager.isRecoverablePreKeySessionError(3, "Bad MAC"),
+        true,
+    );
+    assert.equal(
+        manager.isRecoverablePreKeySessionError(1, "Bad MAC"),
+        false,
+    );
 });

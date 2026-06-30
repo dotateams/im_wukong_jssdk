@@ -189,7 +189,10 @@ export class SessionManager {
   }
 
   isRecoverablePreKeySessionError(messageType: any, message: string) {
-    return Number(messageType) === 3 && message.indexOf('unable to find session for base key') >= 0;
+    if (Number(messageType) !== 3) {
+      return false;
+    }
+    return message.indexOf('unable to find session for base key') >= 0 || message.indexOf('Bad MAC') >= 0;
   }
 
   async encryptMessage(remoteUid: string, remoteDeviceId: string | number, plaintext: string) {
@@ -242,10 +245,6 @@ export class SessionManager {
       if (this.isRecoverablePreKeySessionError(messageType, msg)) {
         console.warn(`Recovering stale Signal session with ${remoteUid}:${remoteDeviceId}: ${msg}`);
         await this.deleteSession(remoteUid, remoteDeviceId);
-        const retryPlaintext = await doDecrypt();
-        return this.arrayBufferToString(retryPlaintext);
-      }
-      if (messageType === 3 && msg.indexOf('Bad MAC') >= 0) {
         const retryPlaintext = await doDecrypt();
         return this.arrayBufferToString(retryPlaintext);
       }
