@@ -58,6 +58,7 @@ export class ChannelManager {
             if (WKSDK.shared().config.provider.channelInfoCallback != null) {
 
                 const channelInfoModel = await WKSDK.shared().config.provider.channelInfoCallback(channel);
+                this.preserveStableChannelMetadata(this.channelInfocacheMap[channelKey], channelInfoModel);
                 this.channelInfocacheMap[channelKey] = channelInfoModel;
                 if (channelInfoModel) {
                     this.notifyListeners(channelInfoModel);
@@ -116,6 +117,20 @@ export class ChannelManager {
         return this.channelInfocacheMap[channel.getChannelKey()];
     }
     // 设置频道缓存
+    private preserveStableChannelMetadata(cached: ChannelInfo | undefined, next: ChannelInfo | undefined) {
+        if (!cached || !next) {
+            return;
+        }
+        if (cached.isE2e === true && next.isE2e !== true) {
+            next.isE2e = true;
+            next.orgData = next.orgData || {};
+            next.orgData.is_e2e = 1;
+            next.orgData.isE2e = true;
+            if ((next as any).e2eEnabledAt === undefined && (cached as any).e2eEnabledAt !== undefined) {
+                (next as any).e2eEnabledAt = (cached as any).e2eEnabledAt;
+            }
+        }
+    }
     setChannleInfoForCache(channelInfo: ChannelInfo) {
         this.channelInfocacheMap[channelInfo.channel.getChannelKey()] = channelInfo;
     }
