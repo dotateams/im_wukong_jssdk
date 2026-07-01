@@ -19,6 +19,7 @@ export interface SignalLikeManager {
     requestGroupSenderKeyRepair?(payload: any): Promise<any>;
     lookupGroupSenderKeyRepairRequests?(payload: any): Promise<any>;
     recoverGroupMessageDecryptFailure?(obj: any, senderUid: string, senderDeviceId: any): Promise<boolean>;
+    invalidateChannelDevicesCache?(channelId: string, channelType?: any): void;
 }
 
 export interface SignalE2EEAdapterOptions {
@@ -70,6 +71,9 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
     public invalidateGroupMemberCache(groupId: string): void {
         this.groupMembersCache.delete(groupId);
         this.groupMembersPromises.delete(groupId);
+        if (typeof this.signalManager.invalidateChannelDevicesCache === "function") {
+            this.signalManager.invalidateChannelDevicesCache(groupId, ChannelTypeGroup);
+        }
     }
 
     public async clearLocalData(): Promise<void> {

@@ -1,116 +1,366 @@
-export class DeviceDirectory {
-  apiClient: any;
-  isSuccessResponse: (resp: any) => boolean;
-  getResponseData: (resp: any) => any;
-  remoteDevicesCache: Map<any, any>;
-  remoteDevicesInFlight: Map<any, any>;
-  remoteDevicesCacheTtlMs: number;
-  channelDevicesCache: Map<any, any>;
-  channelDevicesInFlight: Map<any, any>;
-  channelDevicesCacheTtlMs: number;
+import StorageService from '../storage/StorageService'
 
-  constructor(apiClient: any, isSuccessResponse: (resp: any) => boolean, getResponseData: (resp: any) => any) {
-    this.apiClient = apiClient;
-    this.isSuccessResponse = isSuccessResponse;
-    this.getResponseData = getResponseData;
-    this.remoteDevicesCache = new Map();
-    this.remoteDevicesInFlight = new Map();
-    this.remoteDevicesCacheTtlMs = 30 * 1000;
-    this.channelDevicesCache = new Map();
-    this.channelDevicesInFlight = new Map();
-    this.channelDevicesCacheTtlMs = 5 * 1000;
+type DeviceDirectoryOptions = {
+  uid?: string
+  deviceId?: string | number
+}
+
+export class DeviceDirectory {
+  apiClient: any
+  isSuccessResponse: (resp: any) => boolean
+  getResponseData: (resp: any) => any
+  uid?: string
+  deviceId?: string | number
+  remoteDevicesCache: Map<any, any>
+  remoteDevicesInFlight: Map<any, any>
+  remoteDevicesCacheTtlMs: number
+  channelDevicesCache: Map<any, any>
+  channelDevicesInFlight: Map<any, any>
+  channelDevicesRefreshGeneration: Map<any, number>
+  channelDevicesCacheTtlMs: number
+
+  constructor(
+    apiClient: any,
+    isSuccessResponse: (resp: any) => boolean,
+    getResponseData: (resp: any) => any,
+    options?: DeviceDirectoryOptions,
+  ) {
+    this.apiClient = apiClient
+    this.isSuccessResponse = isSuccessResponse
+    this.getResponseData = getResponseData
+    this.uid = options?.uid
+    this.deviceId = options?.deviceId
+    this.remoteDevicesCache = new Map()
+    this.remoteDevicesInFlight = new Map()
+    this.remoteDevicesCacheTtlMs = 30 * 1000
+    this.channelDevicesCache = new Map()
+    this.channelDevicesInFlight = new Map()
+    this.channelDevicesRefreshGeneration = new Map()
+    // 0 means long-lived. It is invalidated by member changes or forceRefresh.
+    this.channelDevicesCacheTtlMs = 0
   }
 
   async getRemoteDevices(uid: string, forceRefresh?: boolean) {
     if (!this.apiClient || typeof this.apiClient.get !== 'function') {
-      return [];
+      return []
     }
     if (!uid) {
-      return [];
+      return []
     }
-    const now = Date.now();
+    const now = Date.now()
     if (!forceRefresh) {
-      const cached: any = this.remoteDevicesCache.get(uid);
+      const cached: any = this.remoteDevicesCache.get(uid)
       if (cached && cached.devices && cached.fetchedAt && now - cached.fetchedAt < this.remoteDevicesCacheTtlMs) {
-        return cached.devices;
+        return cached.devices
       }
-      const inflight = this.remoteDevicesInFlight.get(uid);
+      const inflight = this.remoteDevicesInFlight.get(uid)
       if (inflight) {
-        return await inflight;
+        return await inflight
       }
     }
     const reqPromise = (async () => {
-      const resp = await this.apiClient.get(`/e2e/devices/${uid}`);
+      const resp = await this.apiClient.get(`/e2e/devices/${uid}`)
       if (!this.isSuccessResponse(resp)) {
-        throw new Error(`Failed to get devices: ${resp && ((resp as any).msg ?? (resp as any).code)}`);
+        throw new Error(`Failed to get devices: ${resp && ((resp as any).msg ?? (resp as any).code)}`)
       }
-      const data: any = this.getResponseData(resp);
-      let devices: any[] = [];
+      const data: any = this.getResponseData(resp)
+      let devices: any[] = []
       if (Array.isArray(data)) {
-        devices = data;
+        devices = data
       } else if (data && Array.isArray(data.devices)) {
-        devices = data.devices;
+        devices = data.devices
       }
-      this.remoteDevicesCache.set(uid, { devices, fetchedAt: Date.now() });
-      return devices;
-    })();
-    this.remoteDevicesInFlight.set(uid, reqPromise);
+      this.remoteDevicesCache.set(uid, { devices, fetchedAt: Date.now() })
+      return devices
+    })()
+    this.remoteDevicesInFlight.set(uid, reqPromise)
     try {
-      return await reqPromise;
+      return await reqPromise
     } finally {
-      this.remoteDevicesInFlight.delete(uid);
+      this.remoteDevicesInFlight.delete(uid)
     }
   }
 
   async getChanelSubscribersDevices(channelId: string, channelType: any, forceRefresh?: boolean) {
     if (!this.apiClient || typeof this.apiClient.get !== 'function') {
-      return [];
+      return []
     }
     if (!channelId) {
-      return [];
+      return []
     }
-    const cacheKey = `${channelId}_${channelType}`;
-    const now = Date.now();
+    const cacheKey = this.getChannelDevicesCacheKey(channelId, channelType)
+    const inflight = this.channelDevicesInFlight.get(cacheKey)
+    if (inflight && (forceRefresh || !this.getChannelDevicesCacheEntry(cacheKey))) {
+      return await inflight
+    }
+
     if (!forceRefresh) {
-      const cached: any = this.channelDevicesCache.get(cacheKey);
-      if (cached && cached.devices && cached.fetchedAt && now - cached.fetchedAt < this.channelDevicesCacheTtlMs) {
-        return cached.devices;
-      }
-      const inflight = this.channelDevicesInFlight.get(cacheKey);
-      if (inflight) {
-        return await inflight;
+      const cached = this.getChannelDevicesCacheEntry(cacheKey)
+      if (cached && Array.isArray(cached.devices) && !this.isChannelDevicesCacheExpired(cached)) {
+        this.scheduleChannelDevicesRefresh(channelId, channelType, cacheKey)
+        return cached.devices
       }
     }
-    const reqPromise = (async () => {
-      const resp = await this.apiClient.get(
-        `/channel/subscribers/e2e_devices?channel_id=${channelId}&channel_type=${channelType}`,
-      );
-      // console.log("getChanelSubscribersDevices resp", resp)
-      if (!this.isSuccessResponse(resp)) {
-        throw new Error(`Failed to get devices: ${resp && ((resp as any).msg ?? (resp as any).code)}`);
+
+    return await this.refreshChannelDevices(channelId, channelType, cacheKey)
+  }
+
+  getChannelDevicesRefreshPromise(channelId: string, channelType: any) {
+    const cacheKey = this.getChannelDevicesCacheKey(channelId, channelType)
+    return this.channelDevicesInFlight.get(cacheKey) || Promise.resolve()
+  }
+
+  invalidateChannelDevicesCache(channelId: string, channelType?: any) {
+    const keys = typeof channelType === 'undefined'
+      ? Array.from(this.channelDevicesCache.keys()).filter((key) => String(key).startsWith(`${channelId}_`))
+      : [this.getChannelDevicesCacheKey(channelId, channelType)]
+    const groupFallbackKey = this.getChannelDevicesCacheKey(channelId, 2)
+    if (typeof channelType === 'undefined' && keys.indexOf(groupFallbackKey) < 0) {
+      keys.push(groupFallbackKey)
+    }
+
+    keys.forEach((cacheKey) => {
+      this.channelDevicesCache.delete(cacheKey)
+      this.channelDevicesInFlight.delete(cacheKey)
+      this.channelDevicesRefreshGeneration.set(cacheKey, (this.channelDevicesRefreshGeneration.get(cacheKey) || 0) + 1)
+      this.removePersistentChannelDevices(cacheKey)
+    })
+  }
+
+  clearLocalData() {
+    this.remoteDevicesCache.clear()
+    this.remoteDevicesInFlight.clear()
+    this.channelDevicesCache.clear()
+    this.channelDevicesInFlight.clear()
+    this.channelDevicesRefreshGeneration.clear()
+    this.clearPersistentChannelDevices()
+  }
+
+  private scheduleChannelDevicesRefresh(channelId: string, channelType: any, cacheKey: string) {
+    if (this.channelDevicesInFlight.has(cacheKey)) {
+      return
+    }
+    const generation = this.channelDevicesRefreshGeneration.get(cacheKey) || 0
+    const reqPromise = new Promise<any[]>((resolve) => {
+      setTimeout(() => {
+        this.validateChannelDevicesVersionAndRefresh(channelId, channelType, cacheKey, generation)
+          .then(resolve)
+          .catch((error) => {
+            if (typeof console !== 'undefined' && console.warn) {
+              console.warn('[E2EE] refresh channel device directory failed', { channelId, channelType }, error)
+            }
+            const cached = this.getChannelDevicesCacheEntry(cacheKey)
+            resolve(cached && Array.isArray(cached.devices) ? cached.devices : [])
+          })
+      }, 0)
+    })
+    this.channelDevicesInFlight.set(cacheKey, reqPromise)
+    reqPromise.finally(() => {
+      if (this.channelDevicesInFlight.get(cacheKey) === reqPromise) {
+        this.channelDevicesInFlight.delete(cacheKey)
       }
-      const data: any = this.getResponseData(resp);
-      let devices: { uid?: string; e2e_devices?: any[]; devices?: any[] }[] = [];
-      if (Array.isArray(data)) {
-        devices = data;
-      } else if (data && Array.isArray(data.devices)) {
-        devices = data.devices;
-      }
-      // 规范化字段名：将 e2e_devices 统一为 devices，确保下游 GroupKeyDistributionManager 能正确读取
-      const normalized = devices.map((item: any) => {
-        if (item && item.e2e_devices && !item.devices) {
-          return { ...item, devices: item.e2e_devices };
-        }
-        return item;
-      });
-      this.channelDevicesCache.set(cacheKey, { devices: normalized, fetchedAt: Date.now() });
-      return normalized;
-    })();
-    this.channelDevicesInFlight.set(cacheKey, reqPromise);
+    })
+  }
+
+  private async refreshChannelDevices(channelId: string, channelType: any, cacheKey: string) {
+    const inflight = this.channelDevicesInFlight.get(cacheKey)
+    if (inflight) {
+      return inflight
+    }
+    const generation = this.channelDevicesRefreshGeneration.get(cacheKey) || 0
+    const reqPromise = this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation)
+    this.channelDevicesInFlight.set(cacheKey, reqPromise)
     try {
-      return await reqPromise;
+      return await reqPromise
     } finally {
-      this.channelDevicesInFlight.delete(cacheKey);
+      if (this.channelDevicesInFlight.get(cacheKey) === reqPromise) {
+        this.channelDevicesInFlight.delete(cacheKey)
+      }
     }
+  }
+
+  private async fetchAndStoreChannelDevices(channelId: string, channelType: any, cacheKey: string, generation: number, versionInfo?: any) {
+    const resp = await this.apiClient.get(
+      `/channel/subscribers/e2e_devices?channel_id=${encodeURIComponent(channelId)}&channel_type=${encodeURIComponent(String(channelType))}`,
+    )
+    if (!this.isSuccessResponse(resp)) {
+      throw new Error(`Failed to get devices: ${resp && ((resp as any).msg ?? (resp as any).code)}`)
+    }
+    const data: any = this.getResponseData(resp)
+    const normalized = this.normalizeChannelDevices(data)
+    if ((this.channelDevicesRefreshGeneration.get(cacheKey) || 0) === generation) {
+      const entry = {
+        devices: normalized,
+        fetchedAt: Date.now(),
+        memberVersion: (data && (data.member_version || data.memberVersion)) || versionInfo?.memberVersion,
+        devicesVersion: (data && (data.devices_version || data.devicesVersion)) || versionInfo?.devicesVersion,
+      }
+      this.channelDevicesCache.set(cacheKey, entry)
+      this.setPersistentChannelDevices(cacheKey, entry)
+    }
+    return normalized
+  }
+
+  private async validateChannelDevicesVersionAndRefresh(channelId: string, channelType: any, cacheKey: string, generation: number) {
+    const cached = this.getChannelDevicesCacheEntry(cacheKey)
+    if (!cached) {
+      return await this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation)
+    }
+    const version = await this.fetchChannelDevicesVersion(channelId, channelType)
+    if (!version) {
+      return cached.devices
+    }
+    const localMemberVersion = cached.memberVersion || cached.member_version
+    const localDevicesVersion = cached.devicesVersion || cached.devices_version
+    const memberChanged = version.memberVersion !== undefined && String(version.memberVersion) !== String(localMemberVersion || '')
+    const devicesChanged = version.devicesVersion !== undefined && String(version.devicesVersion) !== String(localDevicesVersion || '')
+    if (memberChanged || devicesChanged) {
+      return await this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation, version)
+    }
+    return cached.devices
+  }
+
+  private async fetchChannelDevicesVersion(channelId: string, channelType: any) {
+    if (!this.apiClient || typeof this.apiClient.get !== 'function') {
+      return null
+    }
+    try {
+      const resp = await this.apiClient.get(
+        `/channel/subscribers/e2e_devices/version?channel_id=${encodeURIComponent(channelId)}&channel_type=${encodeURIComponent(String(channelType))}`,
+      )
+      if (!this.isSuccessResponse(resp)) {
+        return null
+      }
+      const data: any = this.getResponseData(resp)
+      if (!data) {
+        return null
+      }
+      return {
+        memberVersion: data.member_version || data.memberVersion || data.version,
+        devicesVersion: data.devices_version || data.devicesVersion || data.version,
+      }
+    } catch (error) {
+      return null
+    }
+  }
+
+  private normalizeChannelDevices(data: any) {
+    let devices: { uid?: string; e2e_devices?: any[]; devices?: any[] }[] = []
+    if (Array.isArray(data)) {
+      devices = data
+    } else if (data && Array.isArray(data.devices)) {
+      devices = data.devices
+    }
+    return devices.map((item: any) => {
+      if (item && item.e2e_devices && !item.devices) {
+        return { ...item, devices: item.e2e_devices }
+      }
+      return item
+    })
+  }
+
+  private isChannelDevicesCacheExpired(entry: any) {
+    if (!entry || !entry.fetchedAt) {
+      return true
+    }
+    if (!this.channelDevicesCacheTtlMs || !Number.isFinite(this.channelDevicesCacheTtlMs)) {
+      return false
+    }
+    return Date.now() - entry.fetchedAt >= this.channelDevicesCacheTtlMs
+  }
+
+  private getChannelDevicesCacheEntry(cacheKey: string) {
+    const cached = this.channelDevicesCache.get(cacheKey)
+    if (cached && Array.isArray(cached.devices)) {
+      return cached
+    }
+    const persistent = this.getPersistentChannelDevices(cacheKey)
+    if (persistent && Array.isArray(persistent.devices)) {
+      this.channelDevicesCache.set(cacheKey, persistent)
+      return persistent
+    }
+    return null
+  }
+
+  private getChannelDevicesCacheKey(channelId: string, channelType: any) {
+    return `${channelId}_${channelType}`
+  }
+
+  private getPersistentChannelDevicesKey(cacheKey: string) {
+    if (!this.uid || !this.deviceId) {
+      return ''
+    }
+    return [
+      'wk_signal_channel_devices',
+      encodeURIComponent(String(this.uid)),
+      encodeURIComponent(String(this.deviceId)),
+      encodeURIComponent(cacheKey),
+    ].join('_')
+  }
+
+  private getPersistentChannelDevicesPrefix() {
+    if (!this.uid || !this.deviceId) {
+      return ''
+    }
+    return [
+      'wk_signal_channel_devices',
+      encodeURIComponent(String(this.uid)),
+      encodeURIComponent(String(this.deviceId)),
+      '',
+    ].join('_')
+  }
+
+  private getPersistentChannelDevices(cacheKey: string) {
+    const key = this.getPersistentChannelDevicesKey(cacheKey)
+    if (!key) {
+      return null
+    }
+    const raw = StorageService.shared.getItem(key)
+    if (!raw) {
+      return null
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed && Array.isArray(parsed.devices) ? parsed : null
+    } catch (error) {
+      StorageService.shared.removeItem(key)
+      return null
+    }
+  }
+
+  private setPersistentChannelDevices(cacheKey: string, entry: any) {
+    const key = this.getPersistentChannelDevicesKey(cacheKey)
+    if (!key) {
+      return
+    }
+    try {
+      StorageService.shared.setItem(key, JSON.stringify(entry))
+    } catch (error) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[E2EE] persist channel device directory failed', error)
+      }
+    }
+  }
+
+  private removePersistentChannelDevices(cacheKey: string) {
+    const key = this.getPersistentChannelDevicesKey(cacheKey)
+    if (key) {
+      StorageService.shared.removeItem(key)
+    }
+  }
+
+  private clearPersistentChannelDevices() {
+    const prefix = this.getPersistentChannelDevicesPrefix()
+    if (!prefix || typeof localStorage === 'undefined') {
+      return
+    }
+    const keys: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && key.indexOf(prefix) === 0) {
+        keys.push(key)
+      }
+    }
+    keys.forEach((key) => StorageService.shared.removeItem(key))
   }
 }

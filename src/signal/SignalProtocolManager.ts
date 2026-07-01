@@ -40,7 +40,8 @@ export class SignalProtocolManager {
     this.deviceDirectory = new DeviceDirectory(
       apiClient,
       this.isSuccessResponse.bind(this),
-      this.getResponseData.bind(this)
+      this.getResponseData.bind(this),
+      { uid: this.uid, deviceId: this.deviceId }
     )
     this.keyBundleDirectory = new KeyBundleDirectory(
       apiClient,
@@ -411,6 +412,12 @@ export class SignalProtocolManager {
 
   async getChanelSubscribersDevices(channelId: string, channelType: any, forceRefresh?: boolean) {
     return this.deviceDirectory.getChanelSubscribersDevices(channelId, channelType, forceRefresh)
+  }
+
+  invalidateChannelDevicesCache(channelId: string, channelType?: any) {
+    if (this.deviceDirectory && typeof (this.deviceDirectory as any).invalidateChannelDevicesCache === 'function') {
+      ;(this.deviceDirectory as any).invalidateChannelDevicesCache(channelId, channelType)
+    }
   }
 
   ensureWebCrypto() {
