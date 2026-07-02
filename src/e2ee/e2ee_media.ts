@@ -19,6 +19,8 @@ type MediaPart = {
     size?: number
 }
 
+export const E2EE_MAX_INLINE_DECRYPT_BYTES = 64 * 1024 * 1024
+
 export class E2EEMediaCrypto {
     private apiClient?: E2EEApiClient
     private provider?: E2EEMediaProvider
@@ -201,6 +203,7 @@ export class E2EEMediaCrypto {
         if (!media || !media.original) {
             return undefined
         }
+        this.assertInlineDecryptAllowed(media.original)
         if (media.originalBlobUrl) {
             return media.originalBlobUrl
         }
@@ -254,6 +257,7 @@ export class E2EEMediaCrypto {
         if (!part || !part.url || !part.key || !part.nonce) {
             throw new Error("Invalid E2EE media part")
         }
+        this.assertInlineDecryptAllowed(part)
         const encrypted = await this.fetchEncryptedBlob(part.url)
         const actualHash = await this.sha256(encrypted)
         if (part.sha256 && actualHash !== part.sha256) {
@@ -265,6 +269,13 @@ export class E2EEMediaCrypto {
         const cryptoKey = await subtle.importKey("raw", keyBytes, { name: "AES-GCM", length: 256 }, false, ["decrypt"])
         const decrypted = await subtle.decrypt({ name: "AES-GCM", iv: nonceBytes }, cryptoKey, await encrypted.arrayBuffer())
         return new Blob([decrypted], { type: part.mime || "application/octet-stream" })
+    }
+
+    private assertInlineDecryptAllowed(part: MediaPart): void {
+        const size = Number(part && part.size ? part.size : 0)
+        if (size > E2EE_MAX_INLINE_DECRYPT_BYTES) {
+            throw new Error(`E2EE media is too large for inline decrypt: ${size}`)
+        }
     }
 
     private async decryptCachedThumbnailPart(content: MessageEncryptedMedia, part: MediaPart): Promise<Blob> {

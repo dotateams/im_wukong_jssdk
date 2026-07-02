@@ -15,7 +15,7 @@ import {
     Reply,
 } from "../../src/model";
 import { MessageContentType } from "../../src/const";
-import { E2EEMediaCrypto } from "../../src/e2ee/e2ee_media";
+import { E2EE_MAX_INLINE_DECRYPT_BYTES, E2EEMediaCrypto } from "../../src/e2ee/e2ee_media";
 
 declare const test: (name: string, fn: () => void | Promise<void>) => void;
 
@@ -277,6 +277,35 @@ test("e2ee_chat_manager encrypts media messages in enabled channels", async () =
     assert.ok(encryptedMediaPayload!.thumb.key);
     assert.notEqual(encryptedMediaPayload!.original.key, encryptedMediaPayload!.thumb.key);
     assert.equal(mediaStore.size, 2);
+});
+
+test("e2ee_chat_manager rejects oversized encrypted media inline downloads", async () => {
+    let fetchCalled = false;
+    const media = new E2EEMediaCrypto({
+        provider: {
+            fetchEncryptedMedia: async () => {
+                fetchCalled = true;
+                return new Blob(["should not fetch"]);
+            },
+        },
+    });
+    const content: any = {
+        e2eeMedia: {
+            original: {
+                url: "chat/2/group/large.zip.e2ee",
+                key: "key",
+                nonce: "nonce",
+                sha256: "sha",
+                size: E2EE_MAX_INLINE_DECRYPT_BYTES + 1,
+            },
+        },
+    };
+
+    await assert.rejects(
+        () => media.loadOriginal(content),
+        /too large for inline decrypt/,
+    );
+    assert.equal(fetchCalled, false);
 });
 
 test("e2ee_chat_manager annotates self-sent encrypted files as downloadable", async () => {
