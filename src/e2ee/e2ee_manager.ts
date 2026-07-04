@@ -3,15 +3,29 @@ import { ChannelTypeGroup, ChannelTypePerson } from "../model";
 import type { E2EEDecryptContext, E2EEInitOptions, E2EERecoverContext, E2EESendPlan, ResolveSendPlanOptions } from "./e2ee_types";
 import { SignalE2EEAdapter } from "./e2ee_signal_adapter";
 import { SignalProtocolManager } from "../signal/SignalProtocolManager";
-import { E2EEMediaCrypto } from "./e2ee_media";
+import { E2EEMediaCrypto, SaveOriginalOptions } from "./e2ee_media";
 import { E2EEConfigManager } from "../signal/E2EEConfig";
 
 export class E2EEManager {
     private options?: E2EEInitOptions;
     private mediaCrypto?: E2EEMediaCrypto;
+    private state: "idle" | "pending" | "ready" | "failed" = "idle";
+    private readyAtTimestamp: number = 0;
 
     public get initialized(): boolean {
         return !!this.options;
+    }
+
+    public get readyState(): "idle" | "pending" | "ready" | "failed" {
+        return this.state;
+    }
+
+    public get isReady(): boolean {
+        return this.state === "ready" && !!this.options;
+    }
+
+    public get readyAt(): number {
+        return this.readyAtTimestamp;
     }
 
     public get currentOptions(): E2EEInitOptions | undefined {
@@ -19,29 +33,45 @@ export class E2EEManager {
     }
 
     public async initialize(options: E2EEInitOptions): Promise<void> {
-        if (!options.uid) {
-            throw new Error("E2EE uid is required");
-        }
-        if (!options.deviceId) {
-            throw new Error("E2EE deviceId is required");
-        }
-        this.options = await this.normalizeOptions(options);
-        this.mediaCrypto = new E2EEMediaCrypto({
-            apiClient: this.options.apiClient,
-            provider: this.options.mediaProvider,
-            cacheScope: () => ({
-                uid: this.options?.uid,
-                deviceId: this.options?.deviceId,
-            }),
-        });
-        if (options.apiClient && options.apiClient.registerDeviceKeys) {
-            await options.apiClient.registerDeviceKeys(options);
+        this.state = "pending";
+        this.readyAtTimestamp = 0;
+        try {
+            if (!options.uid) {
+                throw new Error("E2EE uid is required");
+            }
+            if (!options.deviceId) {
+                throw new Error("E2EE deviceId is required");
+            }
+            this.options = await this.normalizeOptions(options);
+            this.mediaCrypto = new E2EEMediaCrypto({
+                apiClient: this.options.apiClient,
+                provider: this.options.mediaProvider,
+                cacheScope: () => ({
+                    uid: this.options?.uid,
+                    deviceId: this.options?.deviceId,
+                }),
+                chunkThresholdBytes: this.options.mediaOptions?.chunkThresholdBytes,
+                chunkSize: this.options.mediaOptions?.chunkSize,
+            });
+            if (options.apiClient && options.apiClient.registerDeviceKeys) {
+                await options.apiClient.registerDeviceKeys(options);
+            }
+            this.state = "ready";
+            this.readyAtTimestamp = Date.now();
+        } catch (error) {
+            this.options = undefined;
+            this.mediaCrypto = undefined;
+            this.state = "failed";
+            this.readyAtTimestamp = 0;
+            throw error;
         }
     }
 
     public reset(): void {
         this.options = undefined;
         this.mediaCrypto = undefined;
+        this.state = "idle";
+        this.readyAtTimestamp = 0;
     }
 
     public async clearLocalPlaintextData(): Promise<void> {
@@ -143,6 +173,27 @@ export class E2EEManager {
         }
     }
 
+    public invalidateGroupRepairRequestCache(channel: Channel): void {
+        if (!this.options || channel.channelType !== ChannelTypeGroup) {
+            return;
+        }
+        const adapter = this.options.cryptoAdapter as any;
+        if (adapter && typeof adapter.invalidateGroupRepairRequestCache === "function") {
+            adapter.invalidateGroupRepairRequestCache(channel.channelID);
+        }
+    }
+
+    // redistributeGroup 强制本端作为发送方重新分发该群 sender key（响应服务端 e2ee_redistribute_request）。
+    public async redistributeGroup(channel: Channel): Promise<void> {
+        if (!this.options || channel.channelType !== ChannelTypeGroup) {
+            return;
+        }
+        const adapter = this.options.cryptoAdapter as any;
+        if (adapter && typeof adapter.redistributeGroup === "function") {
+            await adapter.redistributeGroup(channel);
+        }
+    }
+
     public canEncryptMedia(content: MessageContent): boolean {
         return !!this.mediaCrypto && this.mediaCrypto.canEncrypt(content);
     }
@@ -224,11 +275,25 @@ export class E2EEManager {
         return content;
     }
 
-    public async loadMediaOriginal(content: MessageContent): Promise<string | undefined> {
+    public async loadMediaOriginal(content: MessageContent, options?: SaveOriginalOptions): Promise<string | undefined> {
         if (!this.mediaCrypto) {
             return undefined;
         }
-        return this.mediaCrypto.loadOriginal(content as any);
+        return this.mediaCrypto.loadOriginal(content as any, options);
+    }
+
+    public async loadMediaOriginalBlob(content: MessageContent, options?: SaveOriginalOptions): Promise<Blob | undefined> {
+        if (!this.mediaCrypto) {
+            return undefined;
+        }
+        return this.mediaCrypto.loadOriginalBlob(content as any, options);
+    }
+
+    public async saveMediaOriginal(content: MessageContent, fileName?: string, options?: SaveOriginalOptions): Promise<boolean> {
+        if (!this.mediaCrypto) {
+            return false;
+        }
+        return this.mediaCrypto.saveOriginal(content as any, fileName, options);
     }
 
     public async loadMediaThumbnail(content: MessageContent): Promise<string | undefined> {
@@ -236,6 +301,20 @@ export class E2EEManager {
             return undefined;
         }
         return this.mediaCrypto.loadThumbnail(content as any);
+    }
+
+    public prepareReusableMediaForwardContent(content: MessageContent): MessageContent | undefined {
+        if (!this.mediaCrypto) {
+            return undefined;
+        }
+        return this.mediaCrypto.prepareReusableMediaForwardContent(content as any);
+    }
+
+    public canForwardE2EEMedia(content: MessageContent): { ok: true } | { ok: false; reason: string } {
+        if (!this.mediaCrypto) {
+            return { ok: false, reason: "missing-media" };
+        }
+        return this.mediaCrypto.canForwardE2EEMedia(content as any);
     }
 
     private clearPlaintextStorage(uid: string, deviceId: string): void {
@@ -355,8 +434,8 @@ export class E2EEManager {
                 localUid: options.uid,
                 localDeviceId: options.deviceId,
                 signalManager,
-                getGroupMembers: async (groupId: string) =>
-                    signalManager.getChanelSubscribersDevices(groupId, 2),
+                getGroupMembers: async (groupId: string, memberOptions?: { awaitFreshness?: boolean }) =>
+                    signalManager.getChanelSubscribersDevices(groupId, 2, false, memberOptions),
                 getGroupMemberHash: (_groupId: string, members: any[]) =>
                     signalManager.normalizeMemberHash(undefined, members),
             }),

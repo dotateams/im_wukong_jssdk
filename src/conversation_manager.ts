@@ -54,7 +54,7 @@ export class ConversationManager {
                 if (conversations && conversations.length > 0) {
                     for (const conversation of conversations) {
                         if (conversation.lastMessage) {
-                            await ChatManager.shared().decryptMessageIfNeeded(conversation.lastMessage)
+                            await ChatManager.shared().decryptMessageIfNeeded(conversation.lastMessage, { recoverableSync: true })
                         }
                     }
                 }

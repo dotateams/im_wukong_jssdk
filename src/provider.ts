@@ -22,6 +22,7 @@ export type SyncMessageCallback = (channel:Channel,opts:SyncOptions) => Promise<
 export type SyncMessageExtraCallback =  (channel:Channel,extraVersion:number,limit:number) => Promise<MessageExtra[]> // 消息扩展同步
 
 export type MessageReadedCallback = (channel:Channel,messages:Message[]) => Promise<void> // 消息已读回调
+export type LookupPlainFileByMD5Callback = (fileMD5: string) => Promise<{ exists: boolean; path?: string; size?: number; content_type?: string }>
 
 export class Provider {
 
@@ -49,6 +50,8 @@ export class Provider {
     reminderDoneCallback?: ReminderDoneCallback
     // 消息已读回掉
     messageReadedCallback?: MessageReadedCallback
+    // 按明文 MD5 查询普通文件，用于 E2EE 媒体转发到普通频道时秒传复用
+    lookupPlainFileByMD5Callback?: LookupPlainFileByMD5Callback
 
     
 
@@ -87,6 +90,13 @@ export class Provider {
         if(this.messageUploadTaskCallback) {
             return this.messageUploadTaskCallback(message)
         }
+    }
+
+    public lookupPlainFileByMD5(fileMD5: string): Promise<{ exists: boolean; path?: string; size?: number; content_type?: string } | undefined> {
+        if (this.lookupPlainFileByMD5Callback) {
+            return this.lookupPlainFileByMD5Callback(fileMD5)
+        }
+        return Promise.resolve(undefined)
     }
 
     // 同步最近会话

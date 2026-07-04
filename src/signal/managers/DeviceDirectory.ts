@@ -81,7 +81,15 @@ export class DeviceDirectory {
     }
   }
 
-  async getChanelSubscribersDevices(channelId: string, channelType: any, forceRefresh?: boolean) {
+  // options.awaitFreshness: 在命中缓存时，同步（await）做一次轻量版本校验，若 devices_version/member_version 变化
+  // 则先刷新设备目录再返回。用于“构建群 sender key 分发”这类正确性攸关的路径，避免用陈旧成员/设备集导致
+  // 新登录设备被静默漏掉。相比后台 setTimeout(0) 的尽力而为刷新，这里保证发消息前拿到最新设备集。
+  async getChanelSubscribersDevices(
+    channelId: string,
+    channelType: any,
+    forceRefresh?: boolean,
+    options?: { awaitFreshness?: boolean },
+  ) {
     if (!this.apiClient || typeof this.apiClient.get !== 'function') {
       return []
     }
@@ -97,6 +105,25 @@ export class DeviceDirectory {
     if (!forceRefresh) {
       const cached = this.getChannelDevicesCacheEntry(cacheKey)
       if (cached && Array.isArray(cached.devices) && !this.isChannelDevicesCacheExpired(cached)) {
+        if (options && options.awaitFreshness) {
+          // 同步校验版本并按需刷新（只在版本变化时才全量拉设备），保证分发使用最新设备集。
+          const generation = this.channelDevicesRefreshGeneration.get(cacheKey) || 0
+          try {
+            return await this.validateChannelDevicesVersionAndRefresh(channelId, channelType, cacheKey, generation, true)
+          } catch (error) {
+            if (typeof console !== 'undefined' && console.warn) {
+              console.warn('[E2EE] await-fresh channel device version check failed; forcing full refresh', { channelId, channelType }, error)
+            }
+            try {
+              return await this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation)
+            } catch (refreshError) {
+              if (typeof console !== 'undefined' && console.warn) {
+                console.warn('[E2EE] await-fresh full channel device refresh failed; using cached devices', { channelId, channelType }, refreshError)
+              }
+              return cached.devices
+            }
+          }
+        }
         this.scheduleChannelDevicesRefresh(channelId, channelType, cacheKey)
         return cached.devices
       }
@@ -201,13 +228,16 @@ export class DeviceDirectory {
     return normalized
   }
 
-  private async validateChannelDevicesVersionAndRefresh(channelId: string, channelType: any, cacheKey: string, generation: number) {
+  private async validateChannelDevicesVersionAndRefresh(channelId: string, channelType: any, cacheKey: string, generation: number, refreshWhenVersionMissing?: boolean) {
     const cached = this.getChannelDevicesCacheEntry(cacheKey)
     if (!cached) {
       return await this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation)
     }
     const version = await this.fetchChannelDevicesVersion(channelId, channelType)
     if (!version) {
+      if (refreshWhenVersionMissing) {
+        return await this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation)
+      }
       return cached.devices
     }
     const localMemberVersion = cached.memberVersion || cached.member_version

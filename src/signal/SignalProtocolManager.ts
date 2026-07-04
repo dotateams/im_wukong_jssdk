@@ -112,6 +112,9 @@ export class SignalProtocolManager {
 
   async initialize() {
     const result = await this.preKeyManager.initialize()
+    if (result && (result as any).uploadedKeys) {
+      this.handleLocalKeyRegistrationComplete()
+    }
     await this.applySessionCompatibilityMigration()
     this.preKeyManager.startMaintenance()
     return result
@@ -150,10 +153,16 @@ export class SignalProtocolManager {
   }
 
   handleLocalIdentityRepaired() {
+    this.handleLocalKeyRegistrationComplete()
+  }
+
+  handleLocalKeyRegistrationComplete() {
     if (this.keyBundleDirectory && typeof (this.keyBundleDirectory as any).clearCache === 'function') {
       ;(this.keyBundleDirectory as any).clearCache()
     }
-    if (this.groupManager && typeof (this.groupManager as any).markLocalIdentityRepaired === 'function') {
+    if (this.groupManager && typeof (this.groupManager as any).markFirstLoginKeyRegistrationComplete === 'function') {
+      ;(this.groupManager as any).markFirstLoginKeyRegistrationComplete()
+    } else if (this.groupManager && typeof (this.groupManager as any).markLocalIdentityRepaired === 'function') {
       ;(this.groupManager as any).markLocalIdentityRepaired()
     }
   }
@@ -410,13 +419,19 @@ export class SignalProtocolManager {
     return this.deviceDirectory.getRemoteDevices(uid, forceRefresh)
   }
 
-  async getChanelSubscribersDevices(channelId: string, channelType: any, forceRefresh?: boolean) {
-    return this.deviceDirectory.getChanelSubscribersDevices(channelId, channelType, forceRefresh)
+  async getChanelSubscribersDevices(channelId: string, channelType: any, forceRefresh?: boolean, options?: { awaitFreshness?: boolean }) {
+    return this.deviceDirectory.getChanelSubscribersDevices(channelId, channelType, forceRefresh, options)
   }
 
   invalidateChannelDevicesCache(channelId: string, channelType?: any) {
     if (this.deviceDirectory && typeof (this.deviceDirectory as any).invalidateChannelDevicesCache === 'function') {
       ;(this.deviceDirectory as any).invalidateChannelDevicesCache(channelId, channelType)
+    }
+  }
+
+  invalidateGroupRepairRequestCache(groupId: string) {
+    if (this.groupManager && typeof (this.groupManager as any).invalidateGroupRepairRequestCache === 'function') {
+      ;(this.groupManager as any).invalidateGroupRepairRequestCache(groupId)
     }
   }
 

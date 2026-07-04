@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import { SignalProtocolManager } from "../../src/signal/SignalProtocolManager";
 import { GroupManager } from "../../src/signal/managers/GroupManager";
+import { GroupCipher } from "../../src/signal/ciphers/GroupCipher";
 import { SenderKeyRecord } from "../../src/signal/models/SenderKeyRecord";
 import { SenderKeyState } from "../../src/signal/models/SenderKeyState";
 import { SenderKeyDistributionMessage } from "../../src/signal/models/SenderKeyDistributionMessage";
@@ -671,6 +672,94 @@ test("group manager prepareGroupSend uploads sender key only to pending repair d
     assert.equal(record.getState().messageIndex, 8);
 });
 
+test("group manager encryptGroupMessage uploads pending repair envelopes before sending cached key", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+    manager.groupEncryptionLocks = new Map();
+
+    const record = new SenderKeyRecord({
+        memberHash: "members-v2",
+        states: [
+            new SenderKeyState({
+                keyId: 9,
+                senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                chainKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                signingPubKey: "pub",
+                signingPrivKey: "priv",
+                messageIndex: 8,
+                skipped: {},
+                kdfVersion: "v2",
+            }),
+        ],
+    });
+    let builtMembers: any[] = [];
+    let uploaded = 0;
+    let encrypted = 0;
+
+    manager.parent = {
+        lookupGroupSenderKeyRepairRequests: async () => ({
+            requests: [
+                { recipient_uid: "bob", recipient_device_id: "bob-web" },
+            ],
+        }),
+    };
+    manager.normalizeMemberHash = () => "members-v2";
+    manager.loadSenderKeyRecord = async () => record;
+    manager.saveSenderKeyRecord = async () => undefined;
+    manager.shouldReuploadAfterIdentityRepair = () => false;
+    manager.shouldRetrySenderKeyDistribution = () => false;
+    manager.buildDistributionPayloadForRecord = async (_groupId: string, _record: any, members: any[]) => {
+        builtMembers = members;
+        return {
+            key_id: 9,
+            member_hash: "members-v2",
+            distribution: {
+                ciphertexts: members.flatMap((member: any) =>
+                    member.devices.map((device: any) => ({
+                        uid: member.uid,
+                        device_id: device.device_id,
+                        enc: "aes-256-gcm",
+                        body: "key",
+                    })),
+                ),
+            },
+        };
+    };
+    manager.uploadDistributionEnvelopes = async () => {
+        uploaded += 1;
+    };
+    manager.logPerf = () => undefined;
+
+    const originalEncrypt = GroupCipher.prototype.encrypt;
+    GroupCipher.prototype.encrypt = async function () {
+        encrypted += 1;
+        return {
+            payload: {
+                group_id: "group-1",
+                sender_uid: "alice",
+                key_id: 9,
+                msg_index: 9,
+                ciphertext: "cipher",
+            },
+        };
+    };
+    try {
+        const result = await manager.encryptGroupMessage("group-1", "hello", [
+            { uid: "bob", devices: [{ device_id: "bob-web" }] },
+            { uid: "carol", devices: [{ device_id: "carol-web" }] },
+        ], "members-v2");
+
+        assert.deepEqual(builtMembers, [{ uid: "bob", devices: [{ device_id: "bob-web" }] }]);
+        assert.equal(uploaded, 1);
+        assert.equal(encrypted, 1);
+        assert.equal(result.type, 0);
+        assert.equal(JSON.parse(result.body).sender_device_id, "alice-web");
+    } finally {
+        GroupCipher.prototype.encrypt = originalEncrypt;
+    }
+});
+
 test("group manager prepareGroupSend waits for active group encryption lock", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
@@ -816,6 +905,40 @@ test("group manager reuploads existing sender-key envelopes after local identity
     assert.equal(uploads, 1, "same repair generation should not reupload repeatedly for the same group");
 });
 
+test("group manager starts first-login grace and clears recovery caches without interrupting in-flight recovery", () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.identityRepairGeneration = 0;
+    manager.identityRepairDistributionGroups = new Set(["old"]);
+    manager.firstLoginEnvelopeGraceMs = 30000;
+    manager.firstLoginGraceUntil = 0;
+    const inFlight = Promise.resolve(true);
+    manager.groupEnvelopeRecoveryPromises = new Map([["group-1:alice:alice-web:9:bob:bob-web", inFlight]]);
+    let uploadCacheCleared = false;
+    let missingCacheCleared = false;
+    let forceLookupCleared = false;
+    let repairRequestCleared = false;
+    let stateCacheCleared = false;
+    manager.senderKeyEnvelopeUploadCache = { clear: () => { uploadCacheCleared = true; } };
+    manager.senderKeyEnvelopeUploadPromises = { clear: () => undefined };
+    manager.senderKeyEnvelopeMissingCache = { clear: () => { missingCacheCleared = true; } };
+    manager.senderKeyEnvelopeForceLookupCache = { clear: () => { forceLookupCleared = true; } };
+    manager.senderKeyRepairRequestCache = { clear: () => { repairRequestCleared = true; } };
+    manager.senderKeyStateCache = { clear: () => { stateCacheCleared = true; } };
+
+    const before = Date.now();
+    manager.markFirstLoginKeyRegistrationComplete();
+
+    assert.equal(manager.identityRepairGeneration, 1);
+    assert.equal(manager.identityRepairDistributionGroups.size, 0);
+    assert.ok(manager.firstLoginGraceUntil >= before + 29000);
+    assert.equal(manager.groupEnvelopeRecoveryPromises.get("group-1:alice:alice-web:9:bob:bob-web"), inFlight);
+    assert.equal(uploadCacheCleared, true);
+    assert.equal(missingCacheCleared, true);
+    assert.equal(forceLookupCleared, true);
+    assert.equal(repairRequestCleared, true);
+    assert.equal(stateCacheCleared, true);
+});
+
 test("group manager retries sender key envelope upload after a failed cached attempt", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
@@ -851,6 +974,54 @@ test("group manager retries sender key envelope upload after a failed cached att
     }
 
     assert.equal(uploads, 2);
+});
+
+test("group manager does not suppress later sender key repair after an empty lookup", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+
+    const cached = new Set<string>();
+    manager.senderKeyRepairRequestCache = {
+        has: (key: string) => cached.has(key),
+        set: (key: string) => cached.add(key),
+    };
+
+    let lookups = 0;
+    let uploads = 0;
+    manager.parent = {
+        lookupGroupSenderKeyRepairRequests: async () => {
+            lookups++;
+            if (lookups === 1) {
+                return { requests: [] };
+            }
+            return { requests: [{ recipient_uid: "bob", recipient_device_id: "bob-web" }] };
+        },
+    };
+    manager.buildDistributionPayloadForRecord = async (_groupId: string, _record: any, members: any[]) => {
+        assert.deepEqual(members, [{ uid: "bob", devices: [{ device_id: "bob-web" }] }]);
+        return {
+            key_id: 7,
+            member_hash: "members-v1",
+            distribution: {
+                type: "signal_multi",
+                ciphertexts: [{ uid: "bob", device_id: "bob-web", body: "sender-key" }],
+            },
+        };
+    };
+    manager.uploadDistributionEnvelopes = async () => {
+        uploads++;
+    };
+    const record = {
+        memberHash: "members-v1",
+        getState: () => ({ keyId: 7 }),
+    };
+
+    await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+    await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+
+    assert.equal(lookups, 2);
+    assert.equal(uploads, 1);
 });
 
 test("group manager recovers missing sender key from server envelope and retries decrypt", async () => {
@@ -1202,6 +1373,120 @@ test("group manager suppresses repeated permanent missing sender key envelope lo
     }
 });
 
+test("group manager treats first-login 404 sender key envelope as retryable", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-h5";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    manager.senderKeyEnvelopeRecoveryMaxAttempts = 3;
+    manager.senderKeyEnvelopeRecoveryBaseDelayMs = 1;
+    manager.firstLoginGraceUntil = Date.now() + 30000;
+
+    const distributionPlain = new SenderKeyDistributionMessage({
+        groupId: "group-1",
+        senderUid: "alice",
+        senderDeviceId: "alice-web",
+        keyId: 9,
+        senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        signingPubKey: "pub",
+        memberHash: "members-v2",
+        kdfVersion: "v2",
+    }).toString();
+
+    let saved: SenderKeyRecord | null = null;
+    let attempts = 0;
+    manager.loadSenderKeyRecord = async () => saved;
+    manager.saveSenderKeyRecord = async (_groupId: string, _senderUid: string, record: SenderKeyRecord) => {
+        saved = record;
+    };
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => {
+            attempts++;
+            if (attempts < 3) {
+                const error: any = new Error("envelope not ready");
+                error.status = 404;
+                throw error;
+            }
+            return { envelope: JSON.stringify({ uid: "bob", device_id: "bob-h5", body: "server-envelope", is_ecies: true }) };
+        },
+        decryptGroupDistributionForDevice: async () => distributionPlain,
+        requestGroupSenderKeyRepair: async () => undefined,
+    };
+
+    const recovered = await manager.recoverSenderKeyFromEnvelope({
+        group_id: "group-1",
+        key_id: 9,
+    }, "alice", "alice-web");
+
+    assert.equal(recovered, true);
+    assert.equal(attempts, 3);
+    assert.ok(saved && saved.getStateByKeyId(9));
+});
+
+test("group manager does not poison first-login 404 sender key envelope miss", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-h5";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    manager.senderKeyEnvelopeRecoveryMaxAttempts = 1;
+    manager.senderKeyEnvelopeRecoveryBaseDelayMs = 1;
+    manager.firstLoginGraceUntil = Date.now() + 30000;
+
+    let attempts = 0;
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => {
+            attempts++;
+            const error: any = new Error("envelope not ready");
+            error.status = 404;
+            throw error;
+        },
+        requestGroupSenderKeyRepair: async () => undefined,
+    };
+
+    const payload = {
+        group_id: "group-1",
+        key_id: 9,
+    };
+    const first = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web");
+    const second = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web");
+
+    assert.equal(first, false);
+    assert.equal(second, false);
+    assert.equal(attempts, 2);
+});
+
+test("group manager still poisons 403 sender key envelope lookup inside first-login grace", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-h5";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    manager.senderKeyEnvelopeRecoveryMaxAttempts = 3;
+    manager.senderKeyEnvelopeRecoveryBaseDelayMs = 1;
+    manager.firstLoginGraceUntil = Date.now() + 30000;
+
+    let attempts = 0;
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => {
+            attempts++;
+            const error: any = new Error("forbidden");
+            error.status = 403;
+            throw error;
+        },
+        requestGroupSenderKeyRepair: async () => undefined,
+    };
+
+    const payload = {
+        group_id: "group-1",
+        key_id: 9,
+    };
+    const first = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web");
+    const second = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web");
+
+    assert.equal(first, false);
+    assert.equal(second, false);
+    assert.equal(attempts, 1);
+});
+
 test("group manager rate limits forced realtime sender key envelope lookups", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "bob";
@@ -1237,6 +1522,122 @@ test("group manager rate limits forced realtime sender key envelope lookups", as
     assert.equal(first, false);
     assert.equal(second, false);
     assert.equal(attempts, 1);
+});
+
+test("group manager retries forced realtime sender key lookup after short cooldown", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-h5";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    manager.senderKeyEnvelopeRecoveryMaxAttempts = 1;
+    manager.senderKeyEnvelopeRecoveryBaseDelayMs = 1;
+    manager.senderKeyEnvelopeForceLookupCooldownMs = 1;
+
+    const distributionPlain = new SenderKeyDistributionMessage({
+        groupId: "group-1",
+        senderUid: "alice",
+        senderDeviceId: "alice-web",
+        keyId: 9,
+        senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        signingPubKey: "pub",
+        memberHash: "members-v2",
+        kdfVersion: "v2",
+    }).toString();
+
+    let saved: SenderKeyRecord | null = null;
+    let attempts = 0;
+    manager.loadSenderKeyRecord = async () => saved;
+    manager.saveSenderKeyRecord = async (_groupId: string, _senderUid: string, record: SenderKeyRecord) => {
+        saved = record;
+    };
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => {
+            attempts++;
+            if (attempts === 1) {
+                const error: any = new Error("not found");
+                error.status = 404;
+                throw error;
+            }
+            return { envelope: JSON.stringify({ uid: "bob", device_id: "bob-h5", body: "server-envelope", is_ecies: true }) };
+        },
+        decryptGroupDistributionForDevice: async () => distributionPlain,
+        requestGroupSenderKeyRepair: async () => undefined,
+    };
+
+    const payload = {
+        group_id: "group-1",
+        key_id: 9,
+    };
+    const first = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web", {
+        force: true,
+        reason: "realtime_decrypt_failure",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web", {
+        force: true,
+        reason: "realtime_decrypt_failure",
+    });
+
+    assert.equal(first, false);
+    assert.equal(second, true);
+    assert.equal(attempts, 2);
+    assert.ok(saved && saved.getStateByKeyId(9));
+});
+
+test("group manager forced realtime 404 does not block later normal envelope recovery", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-h5";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    manager.senderKeyEnvelopeRecoveryMaxAttempts = 1;
+    manager.senderKeyEnvelopeRecoveryBaseDelayMs = 1;
+    manager.firstLoginGraceUntil = 0;
+
+    const distributionPlain = new SenderKeyDistributionMessage({
+        groupId: "group-1",
+        senderUid: "alice",
+        senderDeviceId: "alice-web",
+        keyId: 9,
+        senderKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        signingPubKey: "pub",
+        memberHash: "members-v2",
+        kdfVersion: "v2",
+    }).toString();
+
+    let saved: SenderKeyRecord | null = null;
+    let attempts = 0;
+    manager.loadSenderKeyRecord = async () => saved;
+    manager.saveSenderKeyRecord = async (_groupId: string, _senderUid: string, record: SenderKeyRecord) => {
+        saved = record;
+    };
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => {
+            attempts++;
+            if (attempts === 1) {
+                const error: any = new Error("not found");
+                error.status = 404;
+                throw error;
+            }
+            return { envelope: JSON.stringify({ uid: "bob", device_id: "bob-h5", body: "server-envelope", is_ecies: true }) };
+        },
+        decryptGroupDistributionForDevice: async () => distributionPlain,
+        requestGroupSenderKeyRepair: async () => undefined,
+    };
+
+    const payload = {
+        group_id: "group-1",
+        key_id: 9,
+    };
+    const first = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web", {
+        force: true,
+        reason: "realtime_decrypt_failure",
+    });
+    const second = await manager.recoverSenderKeyFromEnvelope(payload, "alice", "alice-web");
+
+    assert.equal(first, false);
+    assert.equal(second, true);
+    assert.equal(attempts, 2);
+    assert.ok(saved && saved.getStateByKeyId(9));
 });
 
 test("group manager member hash changes when e2ee member devices change", () => {

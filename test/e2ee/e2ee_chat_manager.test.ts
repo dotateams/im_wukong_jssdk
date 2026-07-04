@@ -12,6 +12,7 @@ import {
     MessageImage,
     MessageSignalContent,
     MessageText,
+    CMDContent,
     Reply,
 } from "../../src/model";
 import { MessageContentType } from "../../src/const";
@@ -66,6 +67,12 @@ function resetSdk() {
     sdk.channelManager.channelInfocacheMap = {};
     (sdk.chatManager as any).e2eePlaintextMemoryCache?.clear?.();
     (sdk.chatManager as any).e2eeDecryptFailureMemoryCache?.clear?.();
+    for (const timer of ((sdk.chatManager as any).pendingRealtimeE2EETimers?.values?.() || [])) {
+        clearTimeout(timer);
+    }
+    (sdk.chatManager as any).pendingRealtimeE2EEDecrypts?.clear?.();
+    (sdk.chatManager as any).pendingRealtimeE2EETimers?.clear?.();
+    (sdk.chatManager as any).failedGroupE2EEDecrypts?.clear?.();
     try {
         (globalThis as any).localStorage?.clear?.();
         (globalThis as any).sessionStorage?.clear?.();
@@ -76,6 +83,24 @@ function resetSdk() {
 }
 
 WKSDK.shared().register(TestFileContentType, () => new TestFileContent());
+
+async function waitFor(assertion: () => void, timeoutMs: number = 1000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError: any;
+    while (Date.now() <= deadline) {
+        try {
+            assertion();
+            return;
+        } catch (error) {
+            lastError = error;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+    }
+    assertion();
+    if (lastError) {
+        throw lastError;
+    }
+}
 
 function cacheChannelInfo(channel: Channel, isE2e: boolean) {
     const sdk = WKSDK.shared();
@@ -279,10 +304,131 @@ test("e2ee_chat_manager encrypts media messages in enabled channels", async () =
     assert.equal(mediaStore.size, 2);
 });
 
+test("e2ee media creates reusable forward descriptors without reuploading", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    let encryptedMediaPayload: MessageEncryptedMedia | undefined;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: installMediaProvider(mediaStore),
+        cryptoAdapter: {
+            encryptMessage: async (content) => {
+                encryptedMediaPayload = content as MessageEncryptedMedia;
+                return signalContent("signal_media");
+            },
+        },
+    });
+
+    const image = new MessageImage(testFile(["forward image"], "forward.png", "image/png"), 320, 240);
+    await sdk.chatManager.prepareContentForSend(image, channel);
+    assert.ok(encryptedMediaPayload);
+
+    const reusable = sdk.config.e2ee.prepareReusableMediaForwardContent(image) as MessageEncryptedMedia;
+
+    assert.ok(reusable instanceof MessageEncryptedMedia);
+    assert.notStrictEqual(reusable, encryptedMediaPayload);
+    assert.notStrictEqual(reusable.original, encryptedMediaPayload!.original);
+    assert.equal(reusable.original.url, encryptedMediaPayload!.original.url);
+    assert.equal(reusable.original.key, encryptedMediaPayload!.original.key);
+    assert.equal(reusable.thumb.url, encryptedMediaPayload!.thumb.url);
+    assert.equal(reusable.thumb.key, encryptedMediaPayload!.thumb.key);
+    assert.equal(mediaStore.size, 2);
+});
+
+test("e2ee media metadata includes plaintext file md5 for single and chunked uploads", async () => {
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const singleCrypto = new E2EEMediaCrypto({
+        provider: installMediaProvider(new Map<string, Blob>()),
+    });
+    const singleFile = testFile(["hello-md5"], "hello.txt", "text/plain");
+    const single = await singleCrypto.encryptContent(new TestFileContent(singleFile), channel);
+
+    assert.equal(single.original.file_md5, "e9820012060b19cead6148900edf4a32");
+
+    const chunkedCrypto = new E2EEMediaCrypto({
+        provider: {
+            createEncryptedMediaUploadSession: async () => ({ session_id: "session-md5" }),
+            uploadEncryptedMediaChunk: async (blob: Blob, context: any) => ({
+                url: `chunk-${context.chunkIndex}`,
+                size: blob.size,
+            }),
+            completeEncryptedMediaUpload: async () => ({ ok: true }),
+        } as any,
+        chunkThresholdBytes: 4,
+        chunkSize: 3,
+    });
+    const chunkedFile = new File(["hello-md5"], "chunked.txt", { type: "text/plain" });
+    const chunked = await chunkedCrypto.encryptContent(new TestFileContent(chunkedFile), channel);
+
+    assert.equal(chunked.original.mode, "chunked");
+    assert.equal(chunked.original.file_md5, "e9820012060b19cead6148900edf4a32");
+});
+
+test("e2ee media md5 is computed incrementally for chunked uploads", async () => {
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const chunkedCrypto = new E2EEMediaCrypto({
+        provider: {
+            createEncryptedMediaUploadSession: async () => ({ session_id: "session-md5-incremental" }),
+            uploadEncryptedMediaChunk: async (blob: Blob, context: any) => ({
+                url: `chunk-${context.chunkIndex}`,
+                size: blob.size,
+            }),
+            completeEncryptedMediaUpload: async () => ({ ok: true }),
+        } as any,
+        chunkThresholdBytes: 4,
+        chunkSize: 3,
+    });
+    const chunkedFile = new File(["hello-md5"], "chunked.txt", { type: "text/plain" });
+    (chunkedFile as any).arrayBuffer = async () => {
+        throw new Error("full-file arrayBuffer should not be used for chunked md5");
+    };
+
+    const chunked = await chunkedCrypto.encryptContent(new TestFileContent(chunkedFile), channel);
+
+    assert.equal(chunked.original.mode, "chunked");
+    assert.equal(chunked.original.file_md5, "e9820012060b19cead6148900edf4a32");
+});
+
+test("e2ee media forwardability reports typed reasons", async () => {
+    const crypto = new E2EEMediaCrypto();
+
+    assert.deepEqual(crypto.canForwardE2EEMedia(undefined as any), { ok: false, reason: "missing-media" });
+    assert.deepEqual(crypto.canForwardE2EEMedia({ e2eeMedia: { original: { key: "k" } } } as any), { ok: false, reason: "missing-object" });
+    assert.deepEqual(crypto.canForwardE2EEMedia({ e2eeMedia: { original: { url: "u", key: "k", nonce: "n" } } } as any), { ok: false, reason: "missing-hash" });
+    assert.deepEqual(crypto.canForwardE2EEMedia({
+        e2eeMedia: {
+            original: {
+                mode: "chunked",
+                chunks: [
+                    { index: 0, url: "u", key: "k", nonce: "n", sha256: "s" },
+                ],
+            },
+        },
+    } as any), { ok: true });
+});
+
+test("e2ee media exposes decrypted original blob for plaintext forward fallback", async () => {
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const mediaStore = new Map<string, Blob>();
+    const crypto = new E2EEMediaCrypto({
+        provider: installMediaProvider(mediaStore),
+    });
+    const file = testFile(["plain fallback"], "fallback.txt", "text/plain");
+    const encrypted = await crypto.encryptContent(new TestFileContent(file), channel);
+    const blob = await crypto.loadOriginalBlob({ e2eeMedia: encrypted } as any);
+
+    assert.ok(blob);
+    assert.equal(await blob!.text(), "plain fallback");
+});
+
 test("e2ee_chat_manager rejects oversized encrypted media inline downloads", async () => {
     let fetchCalled = false;
     const media = new E2EEMediaCrypto({
-        provider: {
+        mediaProvider: {
             fetchEncryptedMedia: async () => {
                 fetchCalled = true;
                 return new Blob(["should not fetch"]);
@@ -306,6 +452,217 @@ test("e2ee_chat_manager rejects oversized encrypted media inline downloads", asy
         /too large for inline decrypt/,
     );
     assert.equal(fetchCalled, false);
+});
+
+test("e2ee media encrypts oversized files as chunked v2 manifests", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    cacheChannelInfo(channel, true);
+    const uploadedChunks: Array<{ blob: Blob; context: any }> = [];
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        apiClient: {
+            post: async () => ({ session_id: "session-1" }),
+        },
+        cryptoAdapter: {
+            encryptMessage: async (content) => content,
+        },
+        mediaProvider: {
+            uploadEncryptedMediaChunk: async (blob: Blob, context: any) => {
+                uploadedChunks.push({ blob, context });
+                return {
+                    url: `file/preview/chat/chunks/${context.sessionId}/${context.chunkIndex}.e2ee`,
+                    size: blob.size,
+                };
+            },
+            completeEncryptedMediaUpload: async (_context: any) => {
+                return { ok: true };
+            },
+        } as any,
+        mediaOptions: { chunkThresholdBytes: 8, chunkSize: 4 } as any,
+    });
+
+    const file = new File([
+        new Uint8Array([1, 2, 3, 4]),
+        new Uint8Array([5, 6, 7, 8, 9]),
+    ], "large.zip", { type: "application/zip" });
+    const finalContent = await sdk.chatManager.prepareContentForSend(new TestFileContent(file), channel) as any;
+    const encrypted = finalContent.e2eePlaintextContent as MessageEncryptedMedia;
+
+    assert.strictEqual(encrypted.version, 2);
+    assert.strictEqual(encrypted.original.mode, "chunked");
+    assert.strictEqual(encrypted.original.chunk_size, 4);
+    assert.ok(encrypted.original.chunks.length > 1);
+    assert.strictEqual(encrypted.original.size, file.size);
+    assert.strictEqual(typeof encrypted.original.sha256, "string");
+    assert.ok(encrypted.original.sha256.length > 0);
+    assert.strictEqual(encrypted.original.chunk_count, encrypted.original.chunks.length);
+    assert.strictEqual(uploadedChunks.length, encrypted.original.chunks.length);
+    assert.strictEqual(uploadedChunks[0].context.sessionId, "session-1");
+});
+
+test("e2ee media downloads chunked v2 manifests without inline decrypt size limits", async () => {
+    resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const uploaded = new Map<string, Blob>();
+    const crypto = new E2EEMediaCrypto({
+        provider: {
+            createEncryptedMediaUploadSession: async () => ({ session_id: "session-1" }),
+            uploadEncryptedMediaChunk: async (blob: Blob, context: any) => {
+                const url = `chunk-${context.chunkIndex}`;
+                uploaded.set(url, blob);
+                return { url, size: blob.size };
+            },
+            completeEncryptedMediaUpload: async () => ({ ok: true }),
+        } as any,
+        chunkThresholdBytes: 8,
+        chunkSize: 4,
+    });
+    const file = new File([
+        new Uint8Array([1, 2, 3, 4]),
+        new Uint8Array([5, 6, 7, 8, 9]),
+    ], "large.bin", { type: "application/octet-stream" });
+    const encrypted = await crypto.encryptContent(new TestFileContent(file), channel);
+    const downloadCrypto = new E2EEMediaCrypto({
+        provider: {
+            fetchEncryptedMedia: async (url: string) => {
+                const found = uploaded.get(url);
+                if (!found) {
+                    throw new Error(`missing ${url}`);
+                }
+                return found;
+            },
+        },
+    });
+
+    const restoredUrl = await downloadCrypto.loadOriginal({ e2eeMedia: encrypted });
+
+    assert.ok(restoredUrl);
+});
+
+test("e2ee media loadOriginal reports chunked download progress", async () => {
+    resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const uploaded = new Map<string, Blob>();
+    const crypto = new E2EEMediaCrypto({
+        provider: {
+            createEncryptedMediaUploadSession: async () => ({ session_id: "session-1" }),
+            uploadEncryptedMediaChunk: async (blob: Blob, context: any) => {
+                const url = `chunk-${context.chunkIndex}`;
+                uploaded.set(url, blob);
+                return { url, size: blob.size };
+            },
+            completeEncryptedMediaUpload: async () => ({ ok: true }),
+        } as any,
+        chunkThresholdBytes: 8,
+        chunkSize: 4,
+    });
+    const file = new File([
+        new Uint8Array([1, 2, 3, 4]),
+        new Uint8Array([5, 6, 7, 8, 9]),
+    ], "large.bin", { type: "application/octet-stream" });
+    const encrypted = await crypto.encryptContent(new TestFileContent(file), channel);
+    const progressEvents: any[] = [];
+    const downloadCrypto = new E2EEMediaCrypto({
+        provider: {
+            fetchEncryptedMedia: async (url: string, context?: any) => {
+                const found = uploaded.get(url);
+                if (!found) {
+                    throw new Error(`missing ${url}`);
+                }
+                context?.onDownloadProgress?.({ loaded: Math.ceil(found.size / 2), total: found.size });
+                context?.onDownloadProgress?.({ loaded: found.size, total: found.size });
+                return found;
+            },
+        },
+    });
+
+    const restoredUrl = await (downloadCrypto as any).loadOriginal({ e2eeMedia: encrypted }, {
+        onProgress: (progress: any) => progressEvents.push(progress),
+    });
+
+    assert.ok(restoredUrl);
+    assert.ok(progressEvents.some((progress) => progress.phase === "downloading"));
+    assert.ok(progressEvents.some((progress) => progress.percent > 0 && progress.percent < 100));
+    assert.strictEqual(progressEvents[progressEvents.length - 1].percent, 100);
+});
+
+test("e2ee media rejects chunked manifests with missing duplicate or non-contiguous chunks", async () => {
+    resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const uploaded = new Map<string, Blob>();
+    const crypto = new E2EEMediaCrypto({
+        provider: {
+            createEncryptedMediaUploadSession: async () => ({ session_id: "session-1" }),
+            uploadEncryptedMediaChunk: async (blob: Blob, context: any) => {
+                const url = `chunk-${context.chunkIndex}`;
+                uploaded.set(url, blob);
+                return { url, size: blob.size };
+            },
+            completeEncryptedMediaUpload: async () => ({ ok: true }),
+        } as any,
+        chunkThresholdBytes: 8,
+        chunkSize: 4,
+    });
+    const encrypted = await crypto.encryptContent(new TestFileContent(new File([
+        new Uint8Array([1, 2, 3, 4]),
+        new Uint8Array([5, 6, 7, 8, 9]),
+    ], "large.bin", { type: "application/octet-stream" })), channel) as any;
+    const downloadCrypto = new E2EEMediaCrypto({
+        provider: {
+            fetchEncryptedMedia: async (url: string) => {
+                const found = uploaded.get(url);
+                if (!found) {
+                    throw new Error(`missing ${url}`);
+                }
+                return found;
+            },
+        },
+    });
+
+    const missing = JSON.parse(JSON.stringify(encrypted));
+    missing.original.chunks = missing.original.chunks.slice(0, -1);
+    await assert.rejects(() => downloadCrypto.loadOriginalBlob({ e2eeMedia: missing } as any), /chunk/i);
+
+    const duplicate = JSON.parse(JSON.stringify(encrypted));
+    duplicate.original.chunks[1].index = duplicate.original.chunks[0].index;
+    await assert.rejects(() => downloadCrypto.loadOriginalBlob({ e2eeMedia: duplicate } as any), /index|duplicate|chunk/i);
+
+    const overlap = JSON.parse(JSON.stringify(encrypted));
+    overlap.original.chunks[1].offset = overlap.original.chunks[0].offset;
+    await assert.rejects(() => downloadCrypto.loadOriginalBlob({ e2eeMedia: overlap } as any), /offset|chunk/i);
+});
+
+test("e2ee media rejects chunked manifests when whole-file sha256 mismatches", async () => {
+    resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const uploaded = new Map<string, Blob>();
+    const crypto = new E2EEMediaCrypto({
+        provider: {
+            createEncryptedMediaUploadSession: async () => ({ session_id: "session-1" }),
+            uploadEncryptedMediaChunk: async (blob: Blob, context: any) => {
+                const url = `chunk-${context.chunkIndex}`;
+                uploaded.set(url, blob);
+                return { url, size: blob.size };
+            },
+            completeEncryptedMediaUpload: async () => ({ ok: true }),
+        } as any,
+        chunkThresholdBytes: 8,
+        chunkSize: 4,
+    });
+    const encrypted = await crypto.encryptContent(new TestFileContent(new File([
+        new Uint8Array([1, 2, 3, 4]),
+        new Uint8Array([5, 6, 7, 8, 9]),
+    ], "large.bin", { type: "application/octet-stream" })), channel) as any;
+    encrypted.original.sha256 = "0".repeat(64);
+    const downloadCrypto = new E2EEMediaCrypto({
+        provider: {
+            fetchEncryptedMedia: async (url: string) => uploaded.get(url)!,
+        },
+    });
+
+    await assert.rejects(() => downloadCrypto.loadOriginalBlob({ e2eeMedia: encrypted } as any), /hash mismatch/i);
 });
 
 test("e2ee_chat_manager annotates self-sent encrypted files as downloadable", async () => {
@@ -794,6 +1151,61 @@ test("e2ee_media unwraps server encrypted file responses before media decrypt", 
         assert.ok(((restored as any).url || "").indexOf("blob:") === 0);
     } finally {
         (globalThis as any).fetch = oldFetch;
+    }
+});
+
+test("e2ee_media unwraps provider json encrypted file responses before save", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    cacheChannelInfo(channel, true);
+    const mediaStore = new Map<string, Blob>();
+    const provider = installMediaProvider(mediaStore);
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        mediaProvider: provider,
+        cryptoAdapter: {
+            encryptMessage: async (content) => content,
+        },
+    });
+
+    const encrypted = await sdk.config.e2ee.encryptMediaMessage(
+        new TestFileContent(testFile(["small secret body"], "small.txt", "text/plain"), "small.txt", 17),
+        channel,
+    ) as any;
+    const media = encrypted.e2eePlaintextContent as MessageEncryptedMedia;
+    const sourceBlob = mediaStore.get(media.original.url)!;
+    assert.ok(sourceBlob);
+
+    const saved: Blob[] = [];
+    const oldPicker = (globalThis as any).showSaveFilePicker;
+    try {
+        (globalThis as any).showSaveFilePicker = async () => ({
+            createWritable: async () => ({
+                write: async (blob: Blob) => {
+                    saved.push(blob);
+                },
+                close: async () => undefined,
+                abort: async () => undefined,
+            }),
+        });
+        const crypto = new E2EEMediaCrypto({
+            provider: {
+                fetchEncryptedMedia: async (_url: string, context?: any) => {
+                    context?.onDownloadProgress?.({ loaded: sourceBlob.size, total: sourceBlob.size });
+                    return (await serverEncryptedFileResponse(sourceBlob)).blob();
+                },
+            },
+        } as any);
+        const ok = await crypto.saveOriginal({ e2eeMedia: media, name: "small.txt" } as any, "small.txt", {
+            onProgress: () => undefined,
+        });
+        assert.equal(ok, true);
+        assert.equal(saved.length, 1);
+        assert.equal(await saved[0].text(), "small secret body");
+    } finally {
+        (globalThis as any).showSaveFilePicker = oldPicker;
     }
 });
 
@@ -1431,6 +1843,363 @@ test("e2ee_chat_manager realtime signal content recovers and retries decrypt onc
     assert.equal((message.content as MessageText).text, "recovered realtime");
 });
 
+test("e2ee_chat_manager realtime recoverable failures stay pending and retry before final failure", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 8;
+    message.content = signalContent("signal_group");
+    let decryptCalls = 0;
+    let recoverCalls = 0;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                if (decryptCalls < 3) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText("queued realtime recovered");
+            },
+            recoverDecryptFailure: async () => {
+                recoverCalls++;
+                return false;
+            },
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [1, 1, 1];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 4;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 1000;
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true } as any);
+    } finally {
+        console.error = originalError;
+    }
+
+    assert.equal(decryptCalls, 3);
+    assert.equal(recoverCalls, 2);
+    assert.equal((message as any).e2eePendingDecrypt, false);
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.equal((message.content as MessageText).text, "queued realtime recovered");
+});
+
+test("e2ee_chat_manager realtime recoverable failures become final after retry limit", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 9;
+    message.content = signalContent("signal_group");
+    let decryptCalls = 0;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                throw new Error("Missing sender key");
+            },
+            recoverDecryptFailure: async () => false,
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [1, 1, 1];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 3;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 1000;
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true } as any);
+    } finally {
+        console.error = originalError;
+    }
+
+    assert.equal(decryptCalls, 3);
+    assert.equal((message as any).e2eePendingDecrypt, false);
+    assert.equal((message as any).e2eeDecryptFailed, true);
+    assert.ok(message.content instanceof MessageText);
+    assert.ok((message.content as MessageText).text.indexOf("群密钥") >= 0);
+});
+
+test("e2ee_chat_manager realtime deferred retry delivers skeleton before background recovery", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 10;
+    message.content = signalContent("signal_group");
+    let decryptCalls = 0;
+    let recoverCalls = 0;
+    const notified: Message[] = [];
+    const originalNotify = sdk.chatManager.notifyMessageListeners;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                if (decryptCalls < 3) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText("background recovered");
+            },
+            recoverDecryptFailure: async () => {
+                recoverCalls++;
+                return false;
+            },
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [1, 1, 1];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 4;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 1000;
+    (sdk.chatManager as any).notifyMessageListeners = (item: Message) => {
+        notified.push(item);
+    };
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
+        assert.equal(decryptCalls, 1);
+        assert.equal((message as any).e2eePendingDecrypt, true);
+        assert.equal((message.content as MessageText).text, "[E2EE] 正在解密...");
+        await waitFor(() => assert.equal((message.content as MessageText).text, "background recovered"));
+    } finally {
+        console.error = originalError;
+        (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+
+    assert.equal(decryptCalls, 3);
+    assert.equal(recoverCalls, 2);
+    assert.equal(notified.length, 1);
+    assert.equal(notified[0], message);
+    assert.equal((message as any).e2eePendingDecrypt, false);
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.equal((message.content as MessageText).text, "background recovered");
+});
+
+test("e2ee_chat_manager realtime deferred final failure does not use history wording", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 11;
+    message.content = signalContent("signal_group");
+    const notified: Message[] = [];
+    const originalNotify = sdk.chatManager.notifyMessageListeners;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                throw new Error("Missing sender key");
+            },
+            recoverDecryptFailure: async () => false,
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [1, 1];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 2;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 1000;
+    (sdk.chatManager as any).notifyMessageListeners = (item: Message) => {
+        notified.push(item);
+    };
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
+        assert.equal((message as any).e2eePendingDecrypt, true);
+        await waitFor(() => assert.equal((message as any).e2eeDecryptFailed, true));
+    } finally {
+        console.error = originalError;
+        (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+
+    assert.equal(notified.length, 1);
+    assert.equal((message as any).e2eePendingDecrypt, false);
+    assert.equal((message as any).e2eeDecryptFailed, true);
+    assert.ok(message.content instanceof MessageText);
+    assert.ok(!(message.content as MessageText).text.includes("历史消息"));
+});
+
+test("e2ee_chat_manager retries pending realtime group decrypt after sender key arrives late", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 12;
+    message.content = signalContent("signal_group");
+    let decryptCalls = 0;
+    let keyReady = false;
+    const notified: Message[] = [];
+    const originalNotify = sdk.chatManager.notifyMessageListeners;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                if (!keyReady) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText("late key recovered");
+            },
+            recoverDecryptFailure: async () => false,
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [1, 1];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 2;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 1000;
+    (sdk.chatManager as any).notifyMessageListeners = (item: Message) => {
+        notified.push(item);
+    };
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
+        await waitFor(() => assert.equal((message as any).e2eeDecryptFailed, true));
+
+        keyReady = true;
+        const recovered = await (sdk.chatManager as any).retryPendingE2EEDecrypts();
+        assert.equal(recovered, 1);
+    } finally {
+        console.error = originalError;
+        (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+
+    assert.ok(decryptCalls >= 3);
+    assert.equal((message as any).e2eePendingDecrypt, false);
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.equal((message.content as MessageText).text, "late key recovered");
+    assert.equal(notified[notified.length - 1], message);
+});
+
+test("e2ee_chat_manager retries pending realtime group decrypt immediately after group distribution command", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 13;
+    message.content = signalContent("signal_group");
+    const distribution = new Message();
+    distribution.channel = channel;
+    distribution.fromUID = "member-1";
+    distribution.messageSeq = 14;
+    distribution.content = signalContent("signal_group_distribution");
+    let keyReady = false;
+    let decryptCalls = 0;
+    const notified: Message[] = [];
+    const originalNotify = sdk.chatManager.notifyMessageListeners;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async (content: MessageSignalContent) => {
+                if (content.messageType === "signal_group_distribution") {
+                    keyReady = true;
+                    const cmd = new CMDContent();
+                    cmd.cmd = "signal_group_distribution";
+                    cmd.param = { group_id: "group-1" };
+                    return cmd;
+                }
+                decryptCalls++;
+                if (!keyReady) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText("distribution woke pending message");
+            },
+            recoverDecryptFailure: async () => false,
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [10000];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 1;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 60000;
+    (sdk.chatManager as any).notifyMessageListeners = (item: Message) => {
+        notified.push(item);
+    };
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
+        await waitFor(() => assert.equal((message as any).e2eeDecryptFailed, true));
+
+        await sdk.chatManager.decryptMessageIfNeeded(distribution, { realtime: true } as any);
+    } finally {
+        console.error = originalError;
+        (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+
+    assert.equal((message.content as MessageText).text, "distribution woke pending message");
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.equal(notified[notified.length - 1], message);
+    assert.ok(decryptCalls >= 2);
+});
+
+test("e2ee_chat_manager operation errors outside ready window do not retry", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 11;
+    message.content = signalContent("signal_group");
+    let decryptCalls = 0;
+    let recoverCalls = 0;
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                throw new DOMException("operation failed", "OperationError");
+            },
+            recoverDecryptFailure: async () => {
+                recoverCalls++;
+                return true;
+            },
+        } as any,
+    });
+    Object.defineProperty(sdk.config.e2ee as any, "readyAt", {
+        configurable: true,
+        get: () => Date.now() - 60_000,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [1, 1, 1];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 4;
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true } as any);
+    } finally {
+        console.error = originalError;
+        delete (sdk.config.e2ee as any).readyAt;
+    }
+
+    assert.equal(decryptCalls, 1);
+    assert.equal(recoverCalls, 0);
+    assert.equal((message as any).e2eeDecryptFailed, true);
+});
+
 test("e2ee_chat_manager history signal content does not trigger strong recovery", async () => {
     const sdk = resetSdk();
     const channel = new Channel("group-1", ChannelTypeGroup);
@@ -1464,6 +2233,115 @@ test("e2ee_chat_manager history signal content does not trigger strong recovery"
 
     assert.equal(recoverCalls, 0);
     assert.equal((message as any).e2eeDecryptFailed, true);
+});
+
+test("e2ee_chat_manager recoverable synced group message triggers sender key repair", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.content = signalContent("signal_group");
+    let recoverCalls = 0;
+    let decryptCalls = 0;
+
+    await sdk.config.initE2EE({
+        uid: "receiver",
+        deviceId: "receiver-web",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                if (decryptCalls === 1) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText("synced recovered");
+            },
+            recoverDecryptFailure: async (_content: any, _channel: any, context: any) => {
+                recoverCalls++;
+                assert.equal(context.realtime, true);
+                assert.equal(context.fromUID, "member-1");
+                return true;
+            },
+        } as any,
+    });
+
+    await sdk.chatManager.decryptMessageIfNeeded(message, { recoverableSync: true } as any);
+
+    assert.equal(recoverCalls, 1);
+    assert.equal((message.content as MessageText).text, "synced recovered");
+    assert.equal((message as any).e2eeDecryptFailed, false);
+});
+
+test("e2ee_chat_manager recoverable synced group OperationError triggers sender key repair", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.content = signalContent("signal_group");
+    let recoverCalls = 0;
+    let decryptCalls = 0;
+
+    await sdk.config.initE2EE({
+        uid: "receiver",
+        deviceId: "receiver-web",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                if (decryptCalls === 1) {
+                    throw new DOMException("operation failed", "OperationError");
+                }
+                return new MessageText("operation recovered");
+            },
+            recoverDecryptFailure: async (_content: any, _channel: any, context: any) => {
+                recoverCalls++;
+                assert.equal(context.realtime, true);
+                assert.equal(context.fromUID, "member-1");
+                return true;
+            },
+        } as any,
+    });
+
+    await sdk.chatManager.decryptMessageIfNeeded(message, { recoverableSync: true } as any);
+
+    assert.equal(recoverCalls, 1);
+    assert.equal((message.content as MessageText).text, "operation recovered");
+    assert.equal((message as any).e2eeDecryptFailed, false);
+});
+
+test("e2ee_chat_manager keeps recoverable synced group OperationError in failed retry queue", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageID = "m-op-1" as any;
+    message.content = signalContent("signal_group");
+    const originalError = console.error;
+
+    await sdk.config.initE2EE({
+        uid: "receiver",
+        deviceId: "receiver-web",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                throw new DOMException("operation failed", "OperationError");
+            },
+            recoverDecryptFailure: async () => false,
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 1;
+
+    try {
+        console.error = () => undefined;
+        await sdk.chatManager.decryptMessageIfNeeded(message, { recoverableSync: true } as any);
+    } finally {
+        console.error = originalError;
+    }
+
+    const failed = (sdk.chatManager as any).failedGroupE2EEDecrypts;
+    assert.equal((message as any).e2eeDecryptFailed, true);
+    assert.equal(failed.size, 1);
+    assert.equal(failed.get("group-1:2").length, 1);
 });
 
 test("e2ee_chat_manager logs failed decrypt detail when debug is enabled", async () => {

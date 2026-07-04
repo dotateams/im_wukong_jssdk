@@ -1,6 +1,6 @@
 {
   "name": "wukongimjssdk",
-  "version": "1.2.12-e2ee.21",
+  "version": "1.2.12-e2ee.36",
   "wkE2EE": {
     "internalPackage": true,
     "publicBaseVersion": "1.2.11"
@@ -32,6 +32,7 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "lint": "tslint -p tsconfig.json",
     "test": "node test/run-tests.js",
+    "test:e2ee:chunked-512mb": "node scripts/e2ee-chunked-512mb-smoke.js",
     "assert:internal-package": "node scripts/assert-internal-package.js"
   },
   "publishConfig": {

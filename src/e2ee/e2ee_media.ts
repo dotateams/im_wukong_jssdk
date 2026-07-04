@@ -7,12 +7,14 @@ import {
     MessageEncryptedMedia,
 } from "../model"
 import type { E2EEApiClient, E2EEMediaProvider } from "./e2ee_types"
+import CryptoJS from "crypto-js"
 
 type MediaPart = {
     url: string
     key: string
     nonce: string
     sha256: string
+    file_md5?: string
     width?: number
     height?: number
     mime?: string
@@ -20,16 +22,64 @@ type MediaPart = {
 }
 
 export const E2EE_MAX_INLINE_DECRYPT_BYTES = 64 * 1024 * 1024
+export const E2EE_DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024
+
+type ChunkedMediaPart = {
+    mode: "chunked"
+    session_id: string
+    chunk_size: number
+    size: number
+    file_md5?: string
+    mime?: string
+    sha256: string
+    chunk_count: number
+    chunks: Array<MediaPart & {
+        index: number
+        offset: number
+        plain_size: number
+        encrypted_size?: number
+        etag?: string
+    }>
+}
+
+export type E2EEMediaProgressPhase = "uploading" | "downloading" | "decrypting" | "writing"
+
+export type E2EEMediaProgress = {
+    loadedBytes: number
+    totalBytes: number
+    percent: number
+    chunkIndex?: number
+    chunkCount?: number
+    phase: E2EEMediaProgressPhase
+}
+
+export type SaveOriginalOptions = {
+    onProgress?: (progress: E2EEMediaProgress) => void
+}
+
+export type E2EEMediaForwardCheck =
+    | { ok: true }
+    | { ok: false; reason: "missing-media" | "missing-object" | "missing-hash" | "incomplete-chunked-object" }
 
 export class E2EEMediaCrypto {
     private apiClient?: E2EEApiClient
     private provider?: E2EEMediaProvider
     private cacheScope?: () => { uid?: string; deviceId?: string | number }
+    private chunkThresholdBytes: number
+    private chunkSize: number
 
-    constructor(options: { apiClient?: E2EEApiClient; provider?: E2EEMediaProvider; cacheScope?: () => { uid?: string; deviceId?: string | number } } = {}) {
+    constructor(options: {
+        apiClient?: E2EEApiClient
+        provider?: E2EEMediaProvider
+        cacheScope?: () => { uid?: string; deviceId?: string | number }
+        chunkThresholdBytes?: number
+        chunkSize?: number
+    } = {}) {
         this.apiClient = options.apiClient
         this.provider = options.provider
         this.cacheScope = options.cacheScope
+        this.chunkThresholdBytes = Math.max(1, Number(options.chunkThresholdBytes || E2EE_MAX_INLINE_DECRYPT_BYTES))
+        this.chunkSize = Math.max(1, Number(options.chunkSize || E2EE_DEFAULT_CHUNK_SIZE))
     }
 
     public canEncrypt(content: MessageContent): boolean {
@@ -54,10 +104,43 @@ export class E2EEMediaCrypto {
         encrypted.version = Number(media.version || 1)
         encrypted.mediaKind = media.mediaKind || ""
         encrypted.originalContentType = Number(media.originalContentType || content.contentType || 0)
-        encrypted.name = content.name || ""
-        encrypted.original = media.original
-        encrypted.thumb = media.thumb
+        encrypted.name = media.name || content.name || ""
+        encrypted.original = this.cloneJSON(media.original)
+        encrypted.thumb = media.thumb ? this.cloneJSON(media.thumb) : undefined
         return encrypted
+    }
+
+    public prepareReusableMediaForwardContent(content: MessageContent | any): MessageEncryptedMedia | undefined {
+        return this.toEncryptedMediaContent(content)
+    }
+
+    public canForwardE2EEMedia(content: MessageContent | any): E2EEMediaForwardCheck {
+        const media = content instanceof MessageEncryptedMedia ? content : content && content.e2eeMedia
+        if (!media || !media.original) {
+            return { ok: false, reason: "missing-media" }
+        }
+        const original = media.original
+        if (this.isChunkedPart(original)) {
+            if (!Array.isArray(original.chunks) || original.chunks.length === 0) {
+                return { ok: false, reason: "missing-object" }
+            }
+            for (const chunk of original.chunks) {
+                if (!chunk || !chunk.url || !chunk.key || !chunk.nonce) {
+                    return { ok: false, reason: "incomplete-chunked-object" }
+                }
+                if (!chunk.sha256) {
+                    return { ok: false, reason: "missing-hash" }
+                }
+            }
+            return { ok: true }
+        }
+        if (!original.url || !original.key || !original.nonce) {
+            return { ok: false, reason: "missing-object" }
+        }
+        if (!original.sha256) {
+            return { ok: false, reason: "missing-hash" }
+        }
+        return { ok: true }
     }
 
     public async encryptContent(content: MediaMessageContent, channel: Channel): Promise<MessageEncryptedMedia> {
@@ -67,18 +150,13 @@ export class E2EEMediaCrypto {
         }
         const mediaKind = this.resolveMediaKind(content, sourceFile)
         const originalBlob = sourceFile as any as Blob
-        const originalEncrypted = await this.encryptBlob(originalBlob)
-        const originalUrl = await this.uploadEncryptedBlob(originalEncrypted.blob, channel, "original", content.contentType, this.fileNameOf(sourceFile), originalBlob.type)
-        const originalPart: MediaPart = {
-            url: originalUrl,
-            key: originalEncrypted.key,
-            nonce: originalEncrypted.nonce,
-            sha256: originalEncrypted.sha256,
-            width: (content as any).width || 0,
-            height: (content as any).height || 0,
-            mime: originalBlob.type || "application/octet-stream",
-            size: originalBlob.size || 0,
-        }
+        const fileMD5 = await this.md5(originalBlob)
+        const onUploadProgress = typeof (content as any).onUploadProgress === "function"
+            ? (content as any).onUploadProgress
+            : undefined
+        const originalPart = originalBlob.size > this.chunkThresholdBytes
+            ? await this.encryptChunkedBlob(originalBlob, channel, content.contentType, this.fileNameOf(sourceFile), originalBlob.type, fileMD5, onUploadProgress)
+            : await this.encryptSingleOriginalPart(originalBlob, channel, content, sourceFile, fileMD5, onUploadProgress)
 
         let thumbPart: MediaPart | undefined
         const thumbBlob = await this.createThumbnail(originalBlob, content.contentType, mediaKind)
@@ -98,7 +176,7 @@ export class E2EEMediaCrypto {
         }
 
         const encrypted = new MessageEncryptedMedia()
-        encrypted.version = 1
+        encrypted.version = this.isChunkedPart(originalPart) ? 2 : 1
         encrypted.mediaKind = mediaKind
         encrypted.originalContentType = content.contentType
         encrypted.name = this.fileNameOf(sourceFile)
@@ -125,6 +203,7 @@ export class E2EEMediaCrypto {
             version: encrypted.version,
             mediaKind: encrypted.mediaKind,
             originalContentType: encrypted.originalContentType,
+            name: encrypted.name,
             original: encrypted.original,
             thumb: encrypted.thumb,
             displayUrl,
@@ -162,6 +241,7 @@ export class E2EEMediaCrypto {
             version: content.version,
             mediaKind: content.mediaKind,
             originalContentType: content.originalContentType,
+            name: content.name,
             original: content.original,
             thumb: content.thumb,
             displayUrl,
@@ -192,24 +272,43 @@ export class E2EEMediaCrypto {
             version: content.version,
             mediaKind: content.mediaKind,
             originalContentType: content.originalContentType,
+            name: content.name,
             original: content.original,
             thumb: content.thumb,
         }
         return restored
     }
 
-    public async loadOriginal(content: MessageContent | any): Promise<string | undefined> {
+    public async loadOriginal(content: MessageContent | any, options?: SaveOriginalOptions): Promise<string | undefined> {
         const media = content && content.e2eeMedia
         if (!media || !media.original) {
             return undefined
         }
-        this.assertInlineDecryptAllowed(media.original)
         if (media.originalBlobUrl) {
+            const totalBytes = Number(media.original.size || 0)
+            this.emitProgress(options && options.onProgress, {
+                loadedBytes: totalBytes,
+                totalBytes,
+                chunkIndex: 0,
+                chunkCount: this.isChunkedPart(media.original) ? media.original.chunks.length : 1,
+                phase: "writing",
+            })
             return media.originalBlobUrl
         }
-        const blob = await this.decryptPart(media.original)
+        const blob = this.isChunkedPart(media.original)
+            ? await this.decryptChunkedPart(media.original, options)
+            : await this.loadSingleOriginal(media.original, options)
+        this.revokeBlobURL(media.originalBlobUrl)
         media.originalBlobUrl = this.createObjectURL(blob)
         return media.originalBlobUrl
+    }
+
+    public async loadOriginalBlob(content: MessageContent | any, options?: SaveOriginalOptions): Promise<Blob | undefined> {
+        const media = content && content.e2eeMedia
+        if (!media || !media.original) {
+            return undefined
+        }
+        return this.decryptOriginalPart(media.original, options)
     }
 
     public async loadThumbnail(content: MessageContent | any): Promise<string | undefined> {
@@ -222,10 +321,49 @@ export class E2EEMediaCrypto {
         }
         if (media.thumb) {
             const blob = await this.decryptCachedThumbnailPart(media as MessageEncryptedMedia, media.thumb)
+            this.revokeBlobURL(media.displayUrl)
             media.displayUrl = this.createObjectURL(blob)
             return media.displayUrl
         }
         return this.loadOriginal(content)
+    }
+
+    public async saveOriginal(content: MessageContent | any, fileName?: string, options?: SaveOriginalOptions): Promise<boolean> {
+        const media = content && content.e2eeMedia
+        if (!media || !media.original) {
+            return false
+        }
+        const picker = (globalThis as any).showSaveFilePicker
+        if (typeof picker !== "function") {
+            return false
+        }
+        const handle = await picker({
+            suggestedName: fileName || content.name || "file",
+        })
+        const writable = await handle.createWritable()
+        try {
+            if (!this.isChunkedPart(media.original)) {
+                await this.saveSingleOriginal(media.original, writable, options)
+                return true
+            }
+            const blob = await this.decryptChunkedPart(media.original, options)
+            await writable.write(blob)
+            await writable.close()
+            this.emitProgress(options && options.onProgress, {
+                loadedBytes: blob.size,
+                totalBytes: blob.size,
+                chunkIndex: Math.max(0, media.original.chunks.length - 1),
+                chunkCount: media.original.chunks.length,
+                phase: "writing",
+            })
+            return true
+        } catch (error) {
+            try {
+                await writable.abort()
+            } catch (_abortError) {
+            }
+            throw error
+        }
     }
 
     public clearLocalData(): void {
@@ -236,6 +374,107 @@ export class E2EEMediaCrypto {
         }
         const prefix = `wk_e2ee_media_thumb:${scope.uid}:${String(scope.deviceId)}:`
         this.removeStorageKeysByPrefix(storage, prefix)
+    }
+
+    private emitProgress(callback: ((progress: E2EEMediaProgress) => void) | undefined, progress: {
+        loadedBytes: number
+        totalBytes: number
+        chunkIndex?: number
+        chunkCount?: number
+        phase: E2EEMediaProgressPhase
+    }): void {
+        if (!callback) {
+            return
+        }
+        const totalBytes = Math.max(0, Number(progress.totalBytes || 0))
+        const rawLoaded = Math.max(0, Number(progress.loadedBytes || 0))
+        const loadedBytes = totalBytes > 0 ? Math.min(totalBytes, rawLoaded) : rawLoaded
+        const percent = totalBytes > 0 ? Math.max(0, Math.min(100, Math.floor((loadedBytes / totalBytes) * 100))) : 0
+        callback({
+            loadedBytes,
+            totalBytes,
+            percent,
+            chunkIndex: progress.chunkIndex,
+            chunkCount: progress.chunkCount,
+            phase: progress.phase,
+        })
+    }
+
+    private async saveSingleOriginal(part: MediaPart, writable: any, options?: SaveOriginalOptions): Promise<void> {
+        const totalBytes = Number(part.size || 0)
+        this.emitProgress(options && options.onProgress, {
+            loadedBytes: 0,
+            totalBytes,
+            chunkIndex: 0,
+            chunkCount: 1,
+            phase: "downloading",
+        })
+        const blob = await this.decryptPart(part, (event: any) => {
+            const total = Number(event && event.total ? event.total : part.size || 0)
+            const loaded = Math.max(0, Number(event && event.loaded ? event.loaded : 0))
+            const scaledLoaded = total > 0 && totalBytes > 0 ? Math.floor((Math.min(total, loaded) / total) * totalBytes) : Math.min(totalBytes || loaded, loaded)
+            this.emitProgress(options && options.onProgress, {
+                loadedBytes: scaledLoaded,
+                totalBytes,
+                chunkIndex: 0,
+                chunkCount: 1,
+                phase: "downloading",
+            })
+        })
+        this.emitProgress(options && options.onProgress, {
+            loadedBytes: totalBytes,
+            totalBytes,
+            chunkIndex: 0,
+            chunkCount: 1,
+            phase: "decrypting",
+        })
+        await writable.write(blob)
+        this.emitProgress(options && options.onProgress, {
+            loadedBytes: totalBytes || blob.size,
+            totalBytes: totalBytes || blob.size,
+            chunkIndex: 0,
+            chunkCount: 1,
+            phase: "writing",
+        })
+        await writable.close()
+    }
+
+    private async decryptOriginalPart(part: MediaPart | ChunkedMediaPart, options?: SaveOriginalOptions): Promise<Blob> {
+        return this.isChunkedPart(part)
+            ? this.decryptChunkedPart(part, options)
+            : this.loadSingleOriginal(part, options)
+    }
+
+    private async loadSingleOriginal(part: MediaPart, options?: SaveOriginalOptions): Promise<Blob> {
+        const totalBytes = Number(part.size || 0)
+        this.emitProgress(options && options.onProgress, {
+            loadedBytes: 0,
+            totalBytes,
+            chunkIndex: 0,
+            chunkCount: 1,
+            phase: "downloading",
+        })
+        const blob = await this.decryptPart(part, (event: any) => {
+            const total = Number(event && event.total ? event.total : part.size || 0)
+            const loaded = Math.max(0, Number(event && event.loaded ? event.loaded : 0))
+            const scaledLoaded = total > 0 && totalBytes > 0 ? Math.floor((Math.min(total, loaded) / total) * totalBytes) : Math.min(totalBytes || loaded, loaded)
+            this.emitProgress(options && options.onProgress, {
+                loadedBytes: scaledLoaded,
+                totalBytes,
+                chunkIndex: 0,
+                chunkCount: 1,
+                phase: "downloading",
+            })
+        })
+        const finalBytes = totalBytes || blob.size
+        this.emitProgress(options && options.onProgress, {
+            loadedBytes: finalBytes,
+            totalBytes: finalBytes,
+            chunkIndex: 0,
+            chunkCount: 1,
+            phase: "writing",
+        })
+        return blob
     }
 
     private async encryptBlob(blob: Blob): Promise<{ blob: Blob; key: string; nonce: string; sha256: string }> {
@@ -253,12 +492,236 @@ export class E2EEMediaCrypto {
         }
     }
 
-    private async decryptPart(part: MediaPart): Promise<Blob> {
+    private async encryptSingleOriginalPart(
+        originalBlob: Blob,
+        channel: Channel,
+        content: MediaMessageContent,
+        sourceFile: File,
+        fileMD5: string,
+        onUploadProgress?: (progress: E2EEMediaProgress) => void,
+    ): Promise<MediaPart> {
+        const originalEncrypted = await this.encryptBlob(originalBlob)
+        const originalUrl = await this.uploadEncryptedBlob(originalEncrypted.blob, channel, "original", content.contentType, this.fileNameOf(sourceFile), originalBlob.type, (event: any) => {
+            const total = Number(event && event.total ? event.total : originalEncrypted.blob.size)
+            const loaded = Math.max(0, Number(event && event.loaded ? event.loaded : 0))
+            const scaledLoaded = total > 0 ? Math.floor((Math.min(total, loaded) / total) * originalBlob.size) : Math.min(originalBlob.size, loaded)
+            this.emitProgress(onUploadProgress, {
+                loadedBytes: scaledLoaded,
+                totalBytes: originalBlob.size,
+                chunkIndex: 0,
+                chunkCount: 1,
+                phase: "uploading",
+            })
+        })
+        return {
+            url: originalUrl,
+            key: originalEncrypted.key,
+            nonce: originalEncrypted.nonce,
+            sha256: originalEncrypted.sha256,
+            file_md5: fileMD5,
+            width: (content as any).width || 0,
+            height: (content as any).height || 0,
+            mime: originalBlob.type || "application/octet-stream",
+            size: originalBlob.size || 0,
+        }
+    }
+
+    private async encryptChunkedBlob(
+        blob: Blob,
+        channel: Channel,
+        contentType: number,
+        fileName: string,
+        mime?: string,
+        fileMD5?: string,
+        onUploadProgress?: (progress: E2EEMediaProgress) => void,
+    ): Promise<ChunkedMediaPart> {
+        const chunkSize = this.chunkSize
+        const chunkCount = Math.max(1, Math.ceil(blob.size / chunkSize))
+        const plaintextSha256 = await this.sha256(blob)
+        const sessionId = await this.createChunkedUploadSession(channel, contentType, fileName, mime, blob.size, chunkSize, chunkCount)
+        const chunks: ChunkedMediaPart["chunks"] = []
+        let uploadedBytes = 0
+        for (let index = 0; index < chunkCount; index++) {
+            const offset = index * chunkSize
+            const plainChunk = blob.slice(offset, Math.min(offset + chunkSize, blob.size), mime || blob.type || "application/octet-stream")
+            const encrypted = await this.encryptBlob(plainChunk)
+            const uploadedBytesBeforeChunk = uploadedBytes
+            const uploaded = await this.uploadEncryptedChunk(encrypted.blob, {
+                channel,
+                sessionId,
+                chunkIndex: index,
+                chunkCount,
+                offset,
+                plainSize: plainChunk.size,
+                contentType,
+                fileName,
+                mime,
+                onUploadProgress: (event: any) => {
+                    const total = Number(event && event.total ? event.total : encrypted.blob.size)
+                    const loaded = Math.max(0, Number(event && event.loaded ? event.loaded : 0))
+                    const scaledLoaded = total > 0 ? Math.floor((Math.min(total, loaded) / total) * plainChunk.size) : Math.min(plainChunk.size, loaded)
+                    this.emitProgress(onUploadProgress, {
+                        loadedBytes: uploadedBytesBeforeChunk + scaledLoaded,
+                        totalBytes: blob.size,
+                        chunkIndex: index,
+                        chunkCount,
+                        phase: "uploading",
+                    })
+                },
+            })
+            chunks.push({
+                index,
+                offset,
+                plain_size: plainChunk.size,
+                encrypted_size: uploaded.size || encrypted.blob.size,
+                etag: uploaded.etag,
+                url: uploaded.url,
+                key: encrypted.key,
+                nonce: encrypted.nonce,
+                sha256: encrypted.sha256,
+                mime: "application/octet-stream",
+                size: encrypted.blob.size,
+            })
+            uploadedBytes += plainChunk.size
+            this.emitProgress(onUploadProgress, {
+                loadedBytes: uploadedBytes,
+                totalBytes: blob.size,
+                chunkIndex: index,
+                chunkCount,
+                phase: "uploading",
+            })
+        }
+        await this.completeChunkedUpload(channel, sessionId, chunks, contentType, fileName, mime, blob.size)
+        return {
+            mode: "chunked",
+            session_id: sessionId,
+            chunk_size: chunkSize,
+            size: blob.size,
+            file_md5: fileMD5,
+            mime: mime || blob.type || "application/octet-stream",
+            sha256: plaintextSha256,
+            chunk_count: chunkCount,
+            chunks,
+        }
+    }
+
+    private async decryptChunkedPart(part: ChunkedMediaPart, options?: SaveOriginalOptions): Promise<Blob> {
+        if (!part || part.mode !== "chunked" || !Array.isArray(part.chunks) || part.chunks.length === 0) {
+            throw new Error("Invalid E2EE chunked media part")
+        }
+        const sorted = this.validateChunkedPart(part)
+        const pieces: Blob[] = []
+        const totalBytes = Number(part.size || sorted.reduce((sum: number, chunk: any) => sum + Number(chunk.plain_size || 0), 0))
+        let downloadedBytes = 0
+        this.emitProgress(options && options.onProgress, {
+            loadedBytes: 0,
+            totalBytes,
+            chunkIndex: 0,
+            chunkCount: sorted.length,
+            phase: "downloading",
+        })
+        for (const chunk of sorted) {
+            this.emitProgress(options && options.onProgress, {
+                loadedBytes: downloadedBytes,
+                totalBytes,
+                chunkIndex: Number(chunk.index || 0),
+                chunkCount: sorted.length,
+                phase: "downloading",
+            })
+            const blob = await this.decryptPart(chunk, (event: any) => {
+                const total = Number(event && event.total ? event.total : chunk.size || chunk.encrypted_size || chunk.plain_size || 0)
+                const loaded = Math.max(0, Number(event && event.loaded ? event.loaded : 0))
+                const plainSize = Number(chunk.plain_size || 0)
+                const scaledLoaded = total > 0 && plainSize > 0 ? Math.floor((Math.min(total, loaded) / total) * plainSize) : Math.min(plainSize || loaded, loaded)
+                this.emitProgress(options && options.onProgress, {
+                    loadedBytes: downloadedBytes + scaledLoaded,
+                    totalBytes,
+                    chunkIndex: Number(chunk.index || 0),
+                    chunkCount: sorted.length,
+                    phase: "downloading",
+                })
+            })
+            pieces.push(blob)
+            downloadedBytes += Number(chunk.plain_size || blob.size || 0)
+            this.emitProgress(options && options.onProgress, {
+                loadedBytes: downloadedBytes,
+                totalBytes,
+                chunkIndex: Number(chunk.index || 0),
+                chunkCount: sorted.length,
+                phase: "decrypting",
+            })
+        }
+        const blob = new Blob(pieces, { type: part.mime || "application/octet-stream" })
+        const actualHash = await this.sha256(blob)
+        if (actualHash !== part.sha256) {
+            throw new Error("E2EE chunked media hash mismatch")
+        }
+        this.emitProgress(options && options.onProgress, {
+            loadedBytes: totalBytes || blob.size,
+            totalBytes: totalBytes || blob.size,
+            chunkIndex: Math.max(0, sorted.length - 1),
+            chunkCount: sorted.length,
+            phase: "writing",
+        })
+        return blob
+    }
+
+    private validateChunkedPart(part: ChunkedMediaPart): ChunkedMediaPart["chunks"] {
+        if (!part.sha256) {
+            throw new Error("E2EE chunked media sha256 is missing")
+        }
+        const expectedCount = Number(part.chunk_count || 0)
+        if (!Number.isFinite(expectedCount) || expectedCount <= 0) {
+            throw new Error("E2EE chunked media chunk_count is invalid")
+        }
+        if (part.chunks.length !== expectedCount) {
+            throw new Error("E2EE chunked media chunk count mismatch")
+        }
+        const sorted = part.chunks.slice().sort((a, b) => Number(a.index || 0) - Number(b.index || 0))
+        let expectedOffset = 0
+        for (let i = 0; i < sorted.length; i++) {
+            const chunk = sorted[i]
+            const index = Number(chunk.index)
+            if (index !== i) {
+                throw new Error("E2EE chunked media chunk index is not continuous")
+            }
+            const offset = Number(chunk.offset)
+            if (!Number.isFinite(offset) || offset !== expectedOffset) {
+                throw new Error("E2EE chunked media chunk offset is not continuous")
+            }
+            const plainSize = Number(chunk.plain_size || 0)
+            if (!Number.isFinite(plainSize) || plainSize < 0) {
+                throw new Error("E2EE chunked media chunk size is invalid")
+            }
+            expectedOffset += plainSize
+        }
+        const expectedSize = Number(part.size || expectedOffset)
+        if (Number.isFinite(expectedSize) && expectedSize >= 0 && expectedOffset !== expectedSize) {
+            throw new Error("E2EE chunked media total size mismatch")
+        }
+        return sorted
+    }
+
+    private isChunkedPart(part: any): part is ChunkedMediaPart {
+        return !!(part && part.mode === "chunked" && Array.isArray(part.chunks))
+    }
+
+    private revokeBlobURL(url?: string): void {
+        if (!url || url.indexOf("blob:") !== 0) {
+            return
+        }
+        try {
+            URL.revokeObjectURL(url)
+        } catch (_error) {
+        }
+    }
+
+    private async decryptPart(part: MediaPart, onDownloadProgress?: (event: any) => void): Promise<Blob> {
         if (!part || !part.url || !part.key || !part.nonce) {
             throw new Error("Invalid E2EE media part")
         }
         this.assertInlineDecryptAllowed(part)
-        const encrypted = await this.fetchEncryptedBlob(part.url)
+        const encrypted = await this.fetchEncryptedBlob(part.url, onDownloadProgress)
         const actualHash = await this.sha256(encrypted)
         if (part.sha256 && actualHash !== part.sha256) {
             throw new Error("E2EE media hash mismatch")
@@ -272,6 +735,9 @@ export class E2EEMediaCrypto {
     }
 
     private assertInlineDecryptAllowed(part: MediaPart): void {
+        if (this.isChunkedPart(part)) {
+            return
+        }
         const size = Number(part && part.size ? part.size : 0)
         if (size > E2EE_MAX_INLINE_DECRYPT_BYTES) {
             throw new Error(`E2EE media is too large for inline decrypt: ${size}`)
@@ -349,6 +815,7 @@ export class E2EEMediaCrypto {
         contentType: number,
         fileName: string,
         mime?: string,
+        onUploadProgress?: (event: any) => void,
     ): Promise<string> {
         if (this.provider && this.provider.uploadEncryptedMedia) {
             return this.provider.uploadEncryptedMedia(blob, { channel, kind, contentType, fileName, mime })
@@ -357,13 +824,16 @@ export class E2EEMediaCrypto {
             throw new Error("E2EE media upload provider is unavailable")
         }
         const path = this.buildUploadPath(channel, kind, fileName)
-        const result = await this.apiClient.get(`file/upload?path=${path}&type=chat`)
+        const result = await this.apiClient.get(`file/upload?path=${encodeURIComponent(path)}&type=chat`)
         const uploadURL = result && result.url
         if (!uploadURL) {
             throw new Error("E2EE media upload URL is unavailable")
         }
         const form = new FormData()
         form.append("file", blob, `${kind}.e2ee`)
+        if (onUploadProgress && typeof XMLHttpRequest !== "undefined") {
+            return this.uploadEncryptedBlobWithXHR(uploadURL, form, onUploadProgress)
+        }
         const resp = await fetch(uploadURL, {
             method: "POST",
             body: form,
@@ -379,9 +849,149 @@ export class E2EEMediaCrypto {
         return data.path
     }
 
-    private async fetchEncryptedBlob(url: string): Promise<Blob> {
+    private uploadEncryptedBlobWithXHR(uploadURL: string, form: FormData, onUploadProgress: (event: any) => void): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest()
+            xhr.open("POST", uploadURL)
+            const headers = this.buildUploadHeaders()
+            Object.keys(headers).forEach((key) => {
+                xhr.setRequestHeader(key, (headers as any)[key])
+            })
+            xhr.upload.onprogress = (event) => {
+                onUploadProgress({
+                    loaded: event.loaded,
+                    total: event.total,
+                })
+            }
+            xhr.onerror = () => reject(new Error("E2EE media upload failed"))
+            xhr.onload = () => {
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    reject(new Error(`E2EE media upload failed: ${xhr.status}`))
+                    return
+                }
+                try {
+                    const data = JSON.parse(xhr.responseText || "{}")
+                    if (!data || !data.path) {
+                        reject(new Error("E2EE media upload response missing path"))
+                        return
+                    }
+                    resolve(data.path)
+                } catch (error) {
+                    reject(error)
+                }
+            }
+            xhr.send(form)
+        })
+    }
+
+    private async createChunkedUploadSession(
+        channel: Channel,
+        contentType: number,
+        fileName: string,
+        mime: string | undefined,
+        size: number,
+        chunkSize: number,
+        chunkCount: number,
+    ): Promise<string> {
+        const context = { channel, contentType, fileName, mime, size, chunkSize, chunkCount }
+        if (this.provider && this.provider.createEncryptedMediaUploadSession) {
+            const result = await this.provider.createEncryptedMediaUploadSession(context)
+            const sessionId = result && (result.session_id || result.sessionId)
+            if (sessionId) {
+                return sessionId
+            }
+        }
+        if (!this.apiClient || typeof this.apiClient.post !== "function") {
+            throw new Error("E2EE chunked media upload session provider is unavailable")
+        }
+        const result = await this.apiClient.post("file/e2ee/chunked/sessions", {
+            channel_id: channel.channelID,
+            channel_type: channel.channelType,
+            content_type: contentType,
+            file_name: fileName,
+            mime,
+            size,
+            chunk_size: chunkSize,
+            chunk_count: chunkCount,
+        })
+        const sessionId = result && (result.session_id || result.sessionId)
+        if (!sessionId) {
+            throw new Error("E2EE chunked media upload session response missing session_id")
+        }
+        return sessionId
+    }
+
+    private async uploadEncryptedChunk(blob: Blob, context: {
+        channel: Channel
+        sessionId: string
+        chunkIndex: number
+        chunkCount: number
+        offset: number
+        plainSize: number
+        contentType: number
+        fileName?: string
+        mime?: string
+        onUploadProgress?: (event: any) => void
+    }): Promise<{ url: string; size?: number; etag?: string }> {
+        if (this.provider && this.provider.uploadEncryptedMediaChunk) {
+            return this.provider.uploadEncryptedMediaChunk(blob, context)
+        }
+        if (!this.apiClient || typeof (this.apiClient as any).put !== "function") {
+            throw new Error("E2EE chunked media upload provider is unavailable")
+        }
+        const form = new FormData()
+        form.append("file", blob, `${context.chunkIndex}.e2ee`)
+        const result = await (this.apiClient as any).put(`file/e2ee/chunked/sessions/${context.sessionId}/chunks/${context.chunkIndex}`, form, {
+            headers: this.buildUploadHeaders(),
+            onUploadProgress: (event: any) => {
+                if (context.onUploadProgress) {
+                    context.onUploadProgress(event)
+                }
+            },
+        })
+        if (!result || !result.url) {
+            throw new Error("E2EE chunked media upload response missing url")
+        }
+        return result
+    }
+
+    private async completeChunkedUpload(
+        channel: Channel,
+        sessionId: string,
+        chunks: any[],
+        contentType: number,
+        fileName: string,
+        mime: string | undefined,
+        size: number,
+    ): Promise<void> {
+        const context = { channel, sessionId, chunks, contentType, fileName, mime, size }
+        if (this.provider && this.provider.completeEncryptedMediaUpload) {
+            await this.provider.completeEncryptedMediaUpload(context)
+            return
+        }
+        if (this.apiClient && typeof this.apiClient.post === "function") {
+            await this.apiClient.post(`file/e2ee/chunked/sessions/${sessionId}/complete`, {
+                chunks,
+                size,
+            })
+        }
+    }
+
+    private async fetchEncryptedBlob(url: string, onDownloadProgress?: (event: any) => void): Promise<Blob> {
         if (this.provider && this.provider.fetchEncryptedMedia) {
-            return this.provider.fetchEncryptedMedia(url)
+            const blob = await this.provider.fetchEncryptedMedia(url, { onDownloadProgress })
+            const blobType = blob && blob.type ? blob.type : ""
+            if (blobType.indexOf("application/json") >= 0) {
+                try {
+                    const data = JSON.parse(await blob.text())
+                    const unwrapped = await this.unwrapServerEncryptedBlob(data)
+                    if (unwrapped) {
+                        return unwrapped
+                    }
+                } catch (_error) {
+                }
+            }
+            return blob
         }
         const fullURL = this.toAbsoluteURL(url)
         const resp = await fetch(fullURL, { cache: "force-cache" })
@@ -397,7 +1007,36 @@ export class E2EEMediaCrypto {
             }
             return new Blob([JSON.stringify(data)], { type: contentType })
         }
-        return resp.blob()
+        if (!onDownloadProgress || !resp.body || typeof resp.body.getReader !== "function") {
+            const blob = await resp.blob()
+            if (onDownloadProgress) {
+                onDownloadProgress({
+                    loaded: blob.size,
+                    total: blob.size,
+                })
+            }
+            return blob
+        }
+        const contentLength = Number(resp.headers && resp.headers.get ? resp.headers.get("content-length") || 0 : 0)
+        const reader = resp.body.getReader()
+        const chunks: Uint8Array[] = []
+        let loaded = 0
+        while (true) {
+            const result = await reader.read()
+            if (result.done) {
+                break
+            }
+            const value = result.value
+            if (value) {
+                chunks.push(value)
+                loaded += value.byteLength
+                onDownloadProgress({
+                    loaded,
+                    total: contentLength || loaded,
+                })
+            }
+        }
+        return new Blob(chunks, { type: contentType || "application/octet-stream" })
     }
 
     private async unwrapServerEncryptedBlob(data: any): Promise<Blob | undefined> {
@@ -477,7 +1116,7 @@ export class E2EEMediaCrypto {
     private buildUploadPath(channel: Channel, kind: string, fileName: string): string {
         const ext = this.extensionOf(fileName)
         const suffix = ext ? `.${ext}.e2ee` : ".e2ee"
-        return `/${channel.channelType}/${channel.channelID}/${this.uuid()}-${kind}${suffix}`
+        return `${channel.channelType}/${channel.channelID}/${this.uuid()}-${kind}${suffix}`
     }
 
     private toAbsoluteURL(url: string): string {
@@ -533,8 +1172,15 @@ export class E2EEMediaCrypto {
     }
 
     private async sha256(blob: Blob): Promise<string> {
-        const digest = await this.subtleCrypto().digest("SHA-256", await blob.arrayBuffer())
-        return this.base64UrlEncode(new Uint8Array(digest))
+        const hasher = (CryptoJS as any).algo.SHA256.create()
+        const chunkSize = Math.max(1, this.chunkSize || E2EE_DEFAULT_CHUNK_SIZE)
+        for (let offset = 0; offset < blob.size; offset += chunkSize) {
+            const chunk = blob.slice(offset, Math.min(offset + chunkSize, blob.size))
+            const bytes = new Uint8Array(await chunk.arrayBuffer())
+            hasher.update(this.bytesToWordArray(bytes))
+        }
+        const base64 = hasher.finalize().toString((CryptoJS as any).enc.Base64)
+        return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "")
     }
 
     private base64UrlEncode(bytes: Uint8Array): string {
@@ -641,6 +1287,31 @@ export class E2EEMediaCrypto {
             binary += String.fromCharCode(bytes[i])
         }
         return binary
+    }
+
+    private cloneJSON<T>(value: T): T {
+        return value === undefined || value === null
+            ? value
+            : JSON.parse(JSON.stringify(value))
+    }
+
+    private async md5(blob: Blob): Promise<string> {
+        const hasher = (CryptoJS as any).algo.MD5.create()
+        const chunkSize = Math.max(1, this.chunkSize || E2EE_DEFAULT_CHUNK_SIZE)
+        for (let offset = 0; offset < blob.size; offset += chunkSize) {
+            const chunk = blob.slice(offset, Math.min(offset + chunkSize, blob.size))
+            const bytes = new Uint8Array(await chunk.arrayBuffer())
+            hasher.update(this.bytesToWordArray(bytes))
+        }
+        return hasher.finalize().toString()
+    }
+
+    private bytesToWordArray(bytes: Uint8Array): any {
+        const words: number[] = []
+        for (let i = 0; i < bytes.length; i++) {
+            words[i >>> 2] |= bytes[i] << (24 - (i % 4) * 8)
+        }
+        return (CryptoJS as any).lib.WordArray.create(words, bytes.length)
     }
 
     private hashString(value: string): string {

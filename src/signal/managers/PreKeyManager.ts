@@ -43,9 +43,12 @@ export class PreKeyManager {
     const identityKeyPair = await this.store.getIdentityKeyPair()
     if (identityKeyPair) {
       const currentDevice = await this.getCurrentDeviceRegistration()
+      let uploadedKeys = false
+      let identityRepaired = false
       if (!currentDevice.registered) {
         const bundle = await this.generateBundleForExistingIdentity(identityKeyPair)
         await this.uploadPreKeys(bundle)
+        uploadedKeys = true
       } else if (this.isServerIdentityMismatched(identityKeyPair, currentDevice.identityKey)) {
         console.warn('[E2EE] local identity differs from server identity, re-registering device keys', {
           uid: this.uid,
@@ -53,20 +56,24 @@ export class PreKeyManager {
         })
         const bundle = await this.generateBundleForExistingIdentity(identityKeyPair, currentDevice.signedPreKeyId)
         await this.uploadPreKeys(bundle)
+        uploadedKeys = true
+        identityRepaired = true
         if (this.onIdentityRepaired) {
           await this.onIdentityRepaired()
         }
       } else if (!(await this.hasLocalSignedPreKey(currentDevice.signedPreKeyId))) {
         const bundle = await this.generateBundleForExistingIdentity(identityKeyPair, currentDevice.signedPreKeyId)
         await this.uploadPreKeys(bundle)
+        uploadedKeys = true
       }
       console.log('Signal Protocol already initialized')
-      return
+      return { uploadedKeys, newIdentity: false, identityRepaired }
     }
     console.log("初始化信号协议")
     const bundle = await this.generatePreKeyBundle()
     await this.uploadPreKeys(bundle)
     console.log('Signal Protocol initialized successfully')
+    return { uploadedKeys: true, newIdentity: true, identityRepaired: false }
   }
 
   generateRegistrationId() {

@@ -66,6 +66,34 @@ test("e2ee_gate initialization requires uid and deviceId", async () => {
     );
 });
 
+test("e2ee_gate exposes ready pending and failed initialization states", async () => {
+    const manager = new E2EEManager();
+
+    assert.equal((manager as any).readyState, "idle");
+
+    const pending = manager.initialize({
+        uid: "alice",
+        deviceId: "web-1",
+        apiClient: {
+            registerDeviceKeys: async () => {
+                await new Promise((resolve) => setTimeout(resolve, 1));
+            },
+        },
+        autoCreateSignalAdapter: false,
+    } as any);
+    assert.equal((manager as any).readyState, "pending");
+    await pending;
+    assert.equal((manager as any).readyState, "ready");
+    assert.equal((manager as any).isReady, true);
+
+    await assert.rejects(
+        () => manager.initialize({ uid: "", deviceId: "web-1" } as any),
+        /uid is required/,
+    );
+    assert.equal((manager as any).readyState, "failed");
+    assert.equal((manager as any).isReady, false);
+});
+
 test("e2ee_gate plaintext cleanup preserves Signal keys", async () => {
     const manager = new E2EEManager();
     let signalCleared = false;
@@ -180,6 +208,7 @@ test("e2ee_gate auto signal adapter uses cached group subscriber devices while s
     const getChanelSubscribersDevices = SignalProtocolManager.prototype.getChanelSubscribersDevices;
     const encryptGroupMessage = SignalProtocolManager.prototype.encryptGroupMessage;
     const forceRefreshArgs: any[] = [];
+    const awaitFreshnessArgs: any[] = [];
 
     SignalProtocolManager.prototype.initialize = async function () {
         return undefined as any;
@@ -188,8 +217,10 @@ test("e2ee_gate auto signal adapter uses cached group subscriber devices while s
         _channelId: string,
         _channelType: any,
         forceRefresh?: boolean,
+        options?: { awaitFreshness?: boolean },
     ) {
         forceRefreshArgs.push(forceRefresh);
+        awaitFreshnessArgs.push(options && options.awaitFreshness);
         return [{ uid: "bob", devices: [{ device_id: "bob-web" }] }];
     };
     SignalProtocolManager.prototype.encryptGroupMessage = async function (groupId: string) {
@@ -218,13 +249,17 @@ test("e2ee_gate auto signal adapter uses cached group subscriber devices while s
         SignalProtocolManager.prototype.encryptGroupMessage = encryptGroupMessage;
     }
 
-    assert.deepEqual(forceRefreshArgs, [undefined]);
+    // 发送路径不强制全量刷新（forceRefresh 为假），但会请求同步版本校验（awaitFreshness），
+    // 以确保新登录设备被纳入分发。
+    assert.deepEqual(forceRefreshArgs, [false]);
+    assert.deepEqual(awaitFreshnessArgs, [true]);
 });
 
 test("e2ee_gate prewarms encrypted group subscriber devices without forcing refresh", async () => {
     const initialize = SignalProtocolManager.prototype.initialize;
     const getChanelSubscribersDevices = SignalProtocolManager.prototype.getChanelSubscribersDevices;
     const forceRefreshArgs: any[] = [];
+    const awaitFreshnessArgs: any[] = [];
 
     SignalProtocolManager.prototype.initialize = async function () {
         return undefined as any;
@@ -233,8 +268,10 @@ test("e2ee_gate prewarms encrypted group subscriber devices without forcing refr
         _channelId: string,
         _channelType: any,
         forceRefresh?: boolean,
+        options?: { awaitFreshness?: boolean },
     ) {
         forceRefreshArgs.push(forceRefresh);
+        awaitFreshnessArgs.push(options && options.awaitFreshness);
         return [{ uid: "bob", devices: [{ device_id: "bob-web" }] }];
     };
 
@@ -255,5 +292,7 @@ test("e2ee_gate prewarms encrypted group subscriber devices without forcing refr
         SignalProtocolManager.prototype.getChanelSubscribersDevices = getChanelSubscribersDevices;
     }
 
-    assert.deepEqual(forceRefreshArgs, [undefined]);
+    // 预热不强制刷新、也不要求同步版本校验（保持轻量）。
+    assert.deepEqual(forceRefreshArgs, [false]);
+    assert.deepEqual(awaitFreshnessArgs, [undefined]);
 });

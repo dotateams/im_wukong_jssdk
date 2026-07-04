@@ -7,6 +7,7 @@ export interface E2EEApiClient {
     preflightChannelE2EE?: (channel: Channel) => Promise<ChannelInfo | any>;
     get?: (path: string) => Promise<any>;
     post?: (path: string, body?: any) => Promise<any>;
+    put?: (path: string, body?: any, config?: any) => Promise<any>;
 }
 
 export interface E2EEMediaProvider {
@@ -17,12 +18,43 @@ export interface E2EEMediaProvider {
         fileName?: string;
         mime?: string;
     }) => Promise<string>;
-    fetchEncryptedMedia?: (url: string) => Promise<Blob>;
+    fetchEncryptedMedia?: (url: string, context?: {
+        onDownloadProgress?: (event: any) => void;
+    }) => Promise<Blob>;
     createThumbnail?: (file: Blob, context: {
         contentType: number;
         mediaKind: string;
         maxSize: number;
     }) => Promise<Blob | undefined>;
+    createEncryptedMediaUploadSession?: (context: {
+        channel: Channel;
+        contentType: number;
+        fileName?: string;
+        mime?: string;
+        size: number;
+        chunkSize: number;
+        chunkCount: number;
+    }) => Promise<{ session_id?: string; sessionId?: string }>;
+    uploadEncryptedMediaChunk?: (file: Blob, context: {
+        channel: Channel;
+        sessionId: string;
+        chunkIndex: number;
+        chunkCount: number;
+        offset: number;
+        plainSize: number;
+        contentType: number;
+        fileName?: string;
+        mime?: string;
+    }) => Promise<{ url: string; size?: number; etag?: string }>;
+    completeEncryptedMediaUpload?: (context: {
+        channel: Channel;
+        sessionId: string;
+        chunks: any[];
+        contentType: number;
+        fileName?: string;
+        mime?: string;
+        size: number;
+    }) => Promise<any>;
 }
 
 export interface E2EEDecryptContext {
@@ -54,6 +86,10 @@ export interface E2EEInitOptions {
     mediaProvider?: E2EEMediaProvider;
     autoCreateSignalAdapter?: boolean;
     senderKeyEnvelopeConcurrency?: number;
+    mediaOptions?: {
+        chunkThresholdBytes?: number;
+        chunkSize?: number;
+    };
 }
 
 export interface ResolveSendPlanOptions {

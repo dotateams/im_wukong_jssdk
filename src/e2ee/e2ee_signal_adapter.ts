@@ -20,13 +20,19 @@ export interface SignalLikeManager {
     lookupGroupSenderKeyRepairRequests?(payload: any): Promise<any>;
     recoverGroupMessageDecryptFailure?(obj: any, senderUid: string, senderDeviceId: any): Promise<boolean>;
     invalidateChannelDevicesCache?(channelId: string, channelType?: any): void;
+    invalidateGroupRepairRequestCache?(groupId: string): void;
+}
+
+export interface GroupMembersFetchOptions {
+    // 命中缓存时同步校验设备版本并按需刷新，保证分发使用最新设备集（新登录设备不被漏掉）。
+    awaitFreshness?: boolean;
 }
 
 export interface SignalE2EEAdapterOptions {
     localUid?: string;
     localDeviceId: string | number;
     signalManager: SignalLikeManager;
-    getGroupMembers?: (groupId: string) => Promise<any[]>;
+    getGroupMembers?: (groupId: string, options?: GroupMembersFetchOptions) => Promise<any[]>;
     getGroupMemberHash?: (groupId: string, members: any[]) => string | Promise<string>;
 }
 
@@ -34,7 +40,7 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
     private localUid?: string;
     private localDeviceId: string | number;
     private signalManager: SignalLikeManager;
-    private getGroupMembers?: (groupId: string) => Promise<any[]>;
+    private getGroupMembers?: (groupId: string, options?: GroupMembersFetchOptions) => Promise<any[]>;
     private getGroupMemberHash?: (groupId: string, members: any[]) => string | Promise<string>;
     private groupMembersCache: Map<string, { members: any[]; memberHash?: string }> = new Map();
     private groupMembersPromises: Map<string, Promise<{ members: any[]; memberHash?: string }>> = new Map();
@@ -64,7 +70,8 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         if (channel.channelType !== ChannelTypeGroup || !this.signalManager.prepareGroupSend) {
             return;
         }
-        const group = await this.getGroupMembersForEncrypt(channel.channelID);
+        // 发送前保证设备集最新：新登录设备一旦出现在版本里即被纳入分发，避免静默漏掉导致对方无法解密。
+        const group = await this.getGroupMembersForEncrypt(channel.channelID, { awaitFreshness: true });
         await this.signalManager.prepareGroupSend(channel.channelID, group.members, group.memberHash);
     }
 
@@ -74,6 +81,23 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         if (typeof this.signalManager.invalidateChannelDevicesCache === "function") {
             this.signalManager.invalidateChannelDevicesCache(groupId, ChannelTypeGroup);
         }
+    }
+
+    public invalidateGroupRepairRequestCache(groupId: string): void {
+        if (typeof this.signalManager.invalidateGroupRepairRequestCache === "function") {
+            this.signalManager.invalidateGroupRepairRequestCache(groupId);
+        }
+    }
+
+    // redistributeGroup 强制本端作为发送方重新分发该群 sender key（响应服务端 e2ee_redistribute_request）。
+    // 先失效成员/设备缓存，确保把新加入的接收设备纳入本次分发，再触发 prepareGroupSend。
+    public async redistributeGroup(channel: Channel): Promise<void> {
+        if (channel.channelType !== ChannelTypeGroup || !this.signalManager.prepareGroupSend) {
+            return;
+        }
+        this.invalidateGroupMemberCache(channel.channelID);
+        const group = await this.getGroupMembersForEncrypt(channel.channelID, { awaitFreshness: true });
+        await this.signalManager.prepareGroupSend(channel.channelID, group.members, group.memberHash);
     }
 
     public async clearLocalData(): Promise<void> {
@@ -242,7 +266,9 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         if (!this.signalManager.encryptGroupMessage) {
             throw new Error("E2EE group encrypt adapter is unavailable");
         }
-        const group = await this.getGroupMembersForEncrypt(groupId);
+        // 加密发送前同样做版本校验（命中缓存时仅一次轻量版本请求，设备变化才全量拉取），
+        // 确保 memberHash 反映最新设备集，新登录设备被纳入本条消息的内联分发。
+        const group = await this.getGroupMembersForEncrypt(groupId, { awaitFreshness: true });
         const encrypted = await this.signalManager.encryptGroupMessage(groupId, plaintext, group.members, group.memberHash);
         const payload = this.normalizeGroupEncryptedPayload(groupId, encrypted);
         return this.buildSignalContent(
@@ -276,25 +302,37 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         return payload;
     }
 
-    private async getGroupMembersForEncrypt(groupId: string): Promise<{ members: any[]; memberHash?: string }> {
-        const cached = this.groupMembersCache.get(groupId);
-        if (cached) {
-            return cached;
-        }
-        const pending = this.groupMembersPromises.get(groupId);
-        if (pending) {
-            return pending;
+    private async getGroupMembersForEncrypt(
+        groupId: string,
+        options?: GroupMembersFetchOptions,
+    ): Promise<{ members: any[]; memberHash?: string }> {
+        const awaitFreshness = !!(options && options.awaitFreshness);
+        // 正确性攸关路径（构建 sender key 分发）绕过适配器自身的成员缓存，向下透传 awaitFreshness，
+        // 由 DeviceDirectory 做同步版本校验，确保拿到含新登录设备的最新设备集。
+        if (!awaitFreshness) {
+            const cached = this.groupMembersCache.get(groupId);
+            if (cached) {
+                return cached;
+            }
+            const pending = this.groupMembersPromises.get(groupId);
+            if (pending) {
+                return pending;
+            }
         }
         const promise = (async () => {
-            const members = this.getGroupMembers ? await this.getGroupMembers(groupId) : [];
+            const members = this.getGroupMembers ? await this.getGroupMembers(groupId, options) : [];
             const memberHash = this.getGroupMemberHash ? await this.getGroupMemberHash(groupId, members) : undefined;
             const result = { members, memberHash };
             this.groupMembersCache.set(groupId, result);
             return result;
         })().finally(() => {
-            this.groupMembersPromises.delete(groupId);
+            if (!awaitFreshness) {
+                this.groupMembersPromises.delete(groupId);
+            }
         });
-        this.groupMembersPromises.set(groupId, promise);
+        if (!awaitFreshness) {
+            this.groupMembersPromises.set(groupId, promise);
+        }
         return promise;
     }
 

@@ -28,6 +28,9 @@ export class GroupManager {
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
   private readonly senderKeyEnvelopeRecoveryBaseDelayMs: number;
+  private readonly senderKeyEnvelopeForceLookupCooldownMs: number;
+  private readonly firstLoginEnvelopeGraceMs: number;
+  private firstLoginGraceUntil: number;
   senderKeyEnvelopeConcurrency: number;
   private identityRepairGeneration: number;
   private identityRepairDistributionGroups: Set<string>;
@@ -41,6 +44,7 @@ export class GroupManager {
     this.senderKeyEnvelopeUploadPromises = new Map();
     this.identityRepairGeneration = 0;
     this.identityRepairDistributionGroups = new Set();
+    this.firstLoginGraceUntil = 0;
     this.signalStore = new SignalProtocolStoreClass(uid, deviceId);
 
     // 初始化智能缓存
@@ -48,6 +52,8 @@ export class GroupManager {
     this.senderKeyDistributionInterval = Math.max(0, Number(config.senderKeyDistributionInterval || 0));
     this.senderKeyEnvelopeRecoveryMaxAttempts = Math.max(1, Number(config.maxDecryptRetries || 3));
     this.senderKeyEnvelopeRecoveryBaseDelayMs = Math.max(1, Number(config.retryDelayMs || 1000));
+    this.senderKeyEnvelopeForceLookupCooldownMs = Math.max(500, Math.min(Number(config.retryDelayMs || 1000), 3000));
+    this.firstLoginEnvelopeGraceMs = Math.max(0, Number(config.firstLoginEnvelopeGraceMs || 30000));
     this.senderKeyEnvelopeConcurrency = Math.max(1, Number(config.senderKeyEnvelopeConcurrency || config.groupDistributionConcurrency || 10));
     this.senderKeyCache = new SmartLRUCache({
       maxSize: config.maxSenderKeyCacheSize,
@@ -104,6 +110,12 @@ export class GroupManager {
     this.senderKeyEnvelopeForceLookupCache?.clear?.();
     this.senderKeyRepairRequestCache?.clear?.();
     this.senderKeyStateCache?.clear?.();
+  }
+
+  markFirstLoginKeyRegistrationComplete(graceMs?: number) {
+    const duration = Math.max(0, Number(graceMs ?? this.firstLoginEnvelopeGraceMs ?? 30000));
+    this.firstLoginGraceUntil = Date.now() + duration;
+    this.markLocalIdentityRepaired();
   }
 
   private getIdentityRepairDistributionKey(groupId: any): string {
@@ -378,6 +390,8 @@ export class GroupManager {
       let buildMs = 0;
       let uploadMs = 0;
       let envelopeCount = 0;
+      let repairCount = 0;
+      let repairMs = 0;
       if (shouldDistribute) {
         const buildStartedAt = this.now();
         const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, normalizedMemberHash);
@@ -391,6 +405,10 @@ export class GroupManager {
             this.markIdentityRepairDistributionDone(groupId);
           }
         }
+      } else {
+        const repairStartedAt = this.now();
+        repairCount = await this.uploadPendingRepairEnvelopes(groupId, record, normalizedMemberHash);
+        repairMs = this.now() - repairStartedAt;
       }
       // console.log("signal_group payload:", {
       //   group_id: payload.group_id,
@@ -404,11 +422,13 @@ export class GroupManager {
         groupId,
         memberCount: Array.isArray(members) ? members.length : 0,
         envelopeCount,
+        repairCount,
         distributed: !!shouldDistribute,
         loadMs,
         encryptMs,
         buildMs,
         uploadMs,
+        repairMs,
         totalMs: this.now() - startedAt,
       });
       return { type: 0, body: JSON.stringify(payload) };
@@ -516,17 +536,14 @@ export class GroupManager {
     }
     const requests = this.normalizeRepairRequests(resp);
     if (requests.length === 0) {
-      cache.set(cacheKey, true);
       return 0;
     }
     const members = this.repairRequestsToMembers(requests);
     if (members.length === 0) {
-      cache.set(cacheKey, true);
       return 0;
     }
     const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, memberHash || record.memberHash || '');
     if (!distribution) {
-      cache.set(cacheKey, true);
       return 0;
     }
     await this.uploadDistributionEnvelopes(groupId, distribution);
@@ -576,6 +593,20 @@ export class GroupManager {
 
   private getSenderKeyRepairRequestCacheKey(groupId: any, keyId: any): string {
     return `repair:${groupId}:${this.uid}:${this.deviceId}:${keyId}`;
+  }
+
+  // invalidateGroupRepairRequestCache 清除某群的 repair 请求去抖缓存，使下次发送重新轮询 repair 请求。
+  // 在收到“设备集变更”提示后调用，避免 30s 去抖窗口内新加入设备的 repair 请求被忽略。
+  invalidateGroupRepairRequestCache(groupId: any): void {
+    if (!groupId || !this.senderKeyRepairRequestCache) {
+      return;
+    }
+    const prefix = `repair:${groupId}:`;
+    for (const key of this.senderKeyRepairRequestCache.keys()) {
+      if (typeof key === 'string' && key.indexOf(prefix) === 0) {
+        this.senderKeyRepairRequestCache.delete(key);
+      }
+    }
   }
 
   private getSenderKeyRepairRequestCache(): SmartLRUCache<string, boolean> {
@@ -960,7 +991,7 @@ export class GroupManager {
         if (options.force) {
           forceLookupCache.set(recoveryKey, true);
         }
-        if (this.isPermanentEnvelopeLookupError(error)) {
+        if (this.shouldCacheEnvelopeLookupFailure(error, options)) {
           this.getSenderKeyEnvelopeMissingCache().set(recoveryKey, true);
         }
         const config = E2EEConfigManager.getInstance().getConfig();
@@ -1008,9 +1039,10 @@ export class GroupManager {
 
   private getSenderKeyEnvelopeForceLookupCache(): SmartLRUCache<string, boolean> {
     if (!this.senderKeyEnvelopeForceLookupCache) {
+      const cooldownMs = Math.max(1, Number((this as any).senderKeyEnvelopeForceLookupCooldownMs || 1000));
       this.senderKeyEnvelopeForceLookupCache = new SmartLRUCache({
         maxSize: 5000,
-        ttlMs: 60 * 1000,
+        ttlMs: cooldownMs,
       });
     }
     return this.senderKeyEnvelopeForceLookupCache;
@@ -1064,7 +1096,7 @@ export class GroupManager {
         return await this.parent.lookupGroupSenderKeyEnvelope(payload);
       } catch (error) {
         lastError = error;
-        if (this.isPermanentEnvelopeLookupError(error) || attempt >= maxAttempts) {
+        if (this.shouldStopEnvelopeLookupRetry(error) || attempt >= maxAttempts) {
           throw error;
         }
         await this.delay(Math.min(baseDelay * Math.pow(2, attempt - 1), 30000));
@@ -1075,7 +1107,33 @@ export class GroupManager {
 
   private isPermanentEnvelopeLookupError(error: any): boolean {
     const status = Number(error?.status ?? error?.code ?? error?.response?.status ?? 0);
-    return status === 403 || status === 404;
+    if (status === 403) {
+      return true;
+    }
+    return status === 404 && !this.isWithinFirstLoginGrace();
+  }
+
+  private shouldCacheEnvelopeLookupFailure(error: any, options: { force?: boolean; reason?: string } = {}): boolean {
+    if (options.force && this.isEnvelopeNotReadyError(error)) {
+      return false;
+    }
+    return this.isPermanentEnvelopeLookupError(error);
+  }
+
+  private shouldStopEnvelopeLookupRetry(error: any): boolean {
+    if (this.isEnvelopeNotReadyError(error) && this.isWithinFirstLoginGrace()) {
+      return false;
+    }
+    return this.isPermanentEnvelopeLookupError(error);
+  }
+
+  private isEnvelopeNotReadyError(error: any): boolean {
+    const status = Number(error?.status ?? error?.code ?? error?.response?.status ?? 0);
+    return status === 404;
+  }
+
+  private isWithinFirstLoginGrace(): boolean {
+    return Date.now() < Number((this as any).firstLoginGraceUntil || 0);
   }
 
   private isMissingMessageKeyError(error: any): boolean {

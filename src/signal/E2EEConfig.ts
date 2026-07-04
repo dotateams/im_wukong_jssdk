@@ -35,6 +35,7 @@ export interface E2EEConfig {
   maxDecryptRetries: number;
   maxEncryptRetries: number;
   retryDelayMs: number;
+  firstLoginEnvelopeGraceMs: number;
 
   // 监控配置
   metricsEnabled: boolean;
@@ -82,6 +83,7 @@ export const DEFAULT_E2EE_CONFIG: E2EEConfig = {
   maxDecryptRetries: 3,
   maxEncryptRetries: 2,
   retryDelayMs: 1000,
+  firstLoginEnvelopeGraceMs: 5 * 60 * 1000,
 
   // 监控配置
   metricsEnabled: true,
