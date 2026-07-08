@@ -6,6 +6,7 @@ import { Packet, RecvackPacket, RecvPacket, SendackPacket, SendPacket, Setting }
 import { Task, MessageTask, TaskStatus } from "./task";
 import { Md5 } from "md5-typescript";
 import { SecurityManager } from "./security";
+import { utf8BytesToString } from "./utils/utf8";
 
 export type MessageListener = ((message: Message) => void);
 export type MessageStatusListener = ((p: SendackPacket) => void);
@@ -1133,13 +1134,7 @@ export class ChatManager {
     }
 
     uint8ArrayToString(data: Uint8Array): string {
-        const chunkSize = 0x8000
-        const parts: string[] = []
-        for (let offset = 0; offset < data.length; offset += chunkSize) {
-            const chunk = data.subarray(offset, offset + chunkSize)
-            parts.push(String.fromCharCode(...Array.from(chunk)))
-        }
-        return decodeURIComponent(escape(parts.join("")))
+        return utf8BytesToString(data)
     }
 
     debugRawReceivedMessage(message: Message) {

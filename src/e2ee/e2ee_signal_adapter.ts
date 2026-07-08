@@ -8,6 +8,7 @@ import {
     MessageSignalContent,
 } from "../model";
 import type { E2EEDecryptContext, E2EECryptoAdapter, E2EERecoverContext } from "./e2ee_types";
+import { utf8BytesToString } from "../utils/utf8";
 
 export interface SignalLikeManager {
     deviceId?: string | number;
@@ -351,12 +352,7 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
 
     private encodeContentToPlaintext(content: MessageContent): string {
         const encoded = content.encode();
-        const encodedString = String.fromCharCode.apply(null, Array.from(encoded));
-        try {
-            return decodeURIComponent(escape(encodedString));
-        } catch (_error) {
-            return encodedString;
-        }
+        return utf8BytesToString(encoded);
     }
 
     private decodePlaintextToContent(plaintext: string, fallbackType: number): MessageContent {

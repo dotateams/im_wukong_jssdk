@@ -1,4 +1,5 @@
 import BigNumber from "bignumber.js";
+import { utf8BytesToString } from "./utils/utf8";
 
 export default class Decoder {
   data!: Uint8Array;
@@ -39,7 +40,7 @@ export default class Decoder {
     }
     const strUint8Array = this.data.slice(this.offset, this.offset + len);
     this.offset += len;
-    return this.uintToString(Array.from(strUint8Array));
+    return this.uintToString(strUint8Array);
   }
   // 读取剩余的字节
   readRemaining(): Uint8Array {
@@ -47,10 +48,8 @@ export default class Decoder {
     this.offset = this.data.length;
     return data;
   }
-  uintToString(array: any[]) {
-    const encodedString = String.fromCharCode.apply(null, array);
-    const decodedString = decodeURIComponent(escape(encodedString));
-    return decodedString;
+  uintToString(array: Uint8Array) {
+    return utf8BytesToString(array);
   }
   readVariableLength(): number {
     let multiplier = 0;

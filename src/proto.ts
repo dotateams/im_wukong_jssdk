@@ -3,6 +3,7 @@ import Decoder from './decoder';
 import BigNumber from 'bignumber.js';
 import { SecurityManager } from './security';
 import { Md5 } from 'md5-typescript';
+import { utf8BytesToString } from './utils/utf8';
 
 let serverVersion = 0 // 服务端返回的协议版本
 /* tslint:disable */
@@ -190,13 +191,7 @@ export class RecvPacket extends Packet {
 }
 
 function uint8ArrayToUtf8String(data: Uint8Array) {
-  const chunkSize = 0x8000
-  const parts: string[] = []
-  for (let offset = 0; offset < data.length; offset += chunkSize) {
-    const chunk = data.subarray(offset, offset + chunkSize)
-    parts.push(String.fromCharCode(...Array.from(chunk)))
-  }
-  return decodeURIComponent(escape(parts.join('')))
+  return utf8BytesToString(data)
 }
 // ping
 export class PingPacket extends Packet {
