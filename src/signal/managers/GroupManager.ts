@@ -24,6 +24,8 @@ export class GroupManager {
   private senderKeyEnvelopeMissingCache: SmartLRUCache<string, boolean>;
   private senderKeyEnvelopeForceLookupCache: SmartLRUCache<string, boolean>;
   private senderKeyRepairRequestCache: SmartLRUCache<string, boolean>;
+  private senderKeyRepairBatchQueue: Map<string, any>;
+  private senderKeyRepairBatchTimer: any;
   private readonly senderKeyDistributionRetryWindow = 1;
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
@@ -42,6 +44,8 @@ export class GroupManager {
     this.groupEncryptionLocks = new Map();
     this.groupEnvelopeRecoveryPromises = new Map();
     this.senderKeyEnvelopeUploadPromises = new Map();
+    this.senderKeyRepairBatchQueue = new Map();
+    this.senderKeyRepairBatchTimer = null;
     this.identityRepairGeneration = 0;
     this.identityRepairDistributionGroups = new Set();
     this.firstLoginGraceUntil = 0;
@@ -109,6 +113,11 @@ export class GroupManager {
     this.senderKeyEnvelopeMissingCache?.clear?.();
     this.senderKeyEnvelopeForceLookupCache?.clear?.();
     this.senderKeyRepairRequestCache?.clear?.();
+    this.senderKeyRepairBatchQueue?.clear?.();
+    if (this.senderKeyRepairBatchTimer) {
+      clearTimeout(this.senderKeyRepairBatchTimer);
+      this.senderKeyRepairBatchTimer = null;
+    }
     this.senderKeyStateCache?.clear?.();
   }
 
@@ -505,7 +514,7 @@ export class GroupManager {
     }
   }
 
-  async uploadPendingRepairEnvelopes(groupId: any, record: any, memberHash: string): Promise<number> {
+  async uploadPendingRepairEnvelopes(groupId: any, record: any, memberHash: string, options: { background?: boolean } = {}): Promise<number> {
     if (!this.parent || typeof this.parent.lookupGroupSenderKeyRepairRequests !== 'function') {
       return 0;
     }
@@ -525,7 +534,7 @@ export class GroupManager {
         sender_uid: this.uid,
         sender_device_id: this.deviceId,
         key_id: state.keyId,
-        limit: 100,
+        limit: 500,
       });
     } catch (error) {
       const config = E2EEConfigManager.getInstance().getConfig();
@@ -547,8 +556,22 @@ export class GroupManager {
       return 0;
     }
     await this.uploadDistributionEnvelopes(groupId, distribution);
-    cache.set(cacheKey, true);
-    return members.reduce((total, member) => total + this.normalizeMemberDeviceIds(member).length, 0);
+    const repairedCount = members.reduce((total, member) => total + this.normalizeMemberDeviceIds(member).length, 0);
+    const hasMore = !!(resp?.has_more || resp?.hasMore || resp?.data?.has_more || resp?.data?.hasMore);
+    if (hasMore) {
+      setTimeout(() => {
+        this.uploadPendingRepairEnvelopes(groupId, record, memberHash || record.memberHash || '', { background: true })
+          .catch((error) => {
+            const config = E2EEConfigManager.getInstance().getConfig();
+            if (config.debugEnabled || config.verboseLogging) {
+              console.warn('[GroupManager] background drain sender key repair requests failed', error);
+            }
+          });
+      }, options.background ? 1000 : 100);
+    } else {
+      cache.set(cacheKey, true);
+    }
+    return repairedCount;
   }
 
   private normalizeRepairRequests(resp: any): any[] {
@@ -1012,11 +1035,14 @@ export class GroupManager {
       return;
     }
     const cacheKey = `request:${payload.group_id}:${payload.sender_uid}:${payload.sender_device_id}:${payload.key_id}:${payload.recipient_uid}:${payload.recipient_device_id}`;
-    const missingCache = this.getSenderKeyEnvelopeMissingCache();
-    if (missingCache.get(cacheKey)) {
+    const requestCache = this.getSenderKeyRepairRequestCache();
+    if (requestCache.get(cacheKey)) {
       return;
     }
-    missingCache.set(cacheKey, true);
+    requestCache.set(cacheKey, true);
+    if (typeof this.parent.requestGroupSenderKeyRepairBatch === 'function') {
+      return this.enqueueSenderKeyRepairRequest(cacheKey, payload);
+    }
     try {
       await this.parent.requestGroupSenderKeyRepair(payload);
     } catch (error) {
@@ -1024,6 +1050,64 @@ export class GroupManager {
       if (config.debugEnabled || config.verboseLogging) {
         console.warn('[GroupManager] request sender key repair failed', error);
       }
+    }
+  }
+
+  private enqueueSenderKeyRepairRequest(cacheKey: string, payload: any): Promise<void> {
+    if (!this.senderKeyRepairBatchQueue) {
+      this.senderKeyRepairBatchQueue = new Map();
+    }
+    return new Promise((resolve) => {
+      const existing = this.senderKeyRepairBatchQueue.get(cacheKey);
+      if (existing) {
+        existing.resolvers.push(resolve);
+      } else {
+        this.senderKeyRepairBatchQueue.set(cacheKey, {
+          payload,
+          resolvers: [resolve],
+        });
+      }
+      if (this.senderKeyRepairBatchQueue.size >= 100) {
+        this.flushSenderKeyRepairBatchQueue();
+        return;
+      }
+      if (!this.senderKeyRepairBatchTimer) {
+        this.senderKeyRepairBatchTimer = setTimeout(() => {
+          this.senderKeyRepairBatchTimer = null;
+          this.flushSenderKeyRepairBatchQueue();
+        }, 50);
+      }
+    });
+  }
+
+  private async flushSenderKeyRepairBatchQueue(): Promise<void> {
+    if (!this.senderKeyRepairBatchQueue || this.senderKeyRepairBatchQueue.size <= 0) {
+      return;
+    }
+    if (this.senderKeyRepairBatchTimer) {
+      clearTimeout(this.senderKeyRepairBatchTimer);
+      this.senderKeyRepairBatchTimer = null;
+    }
+    const entries = Array.from(this.senderKeyRepairBatchQueue.values());
+    this.senderKeyRepairBatchQueue.clear();
+    const requests = entries.map((entry) => entry.payload);
+    try {
+      await this.parent.requestGroupSenderKeyRepairBatch({ requests });
+    } catch (error) {
+      await Promise.all(requests.map(async (request) => {
+        try {
+          await this.parent.requestGroupSenderKeyRepair(request);
+        } catch (fallbackError) {
+          const config = E2EEConfigManager.getInstance().getConfig();
+          if (config.debugEnabled || config.verboseLogging) {
+            console.warn('[GroupManager] request sender key repair fallback failed', fallbackError);
+          }
+        }
+      }));
+    } finally {
+      entries.forEach((entry) => {
+        entry.resolvers.forEach((resolve: any) => resolve());
+      });
     }
   }
 

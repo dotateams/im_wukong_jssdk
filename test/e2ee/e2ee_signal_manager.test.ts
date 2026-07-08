@@ -606,6 +606,56 @@ test("group manager requests targeted sender key repair when envelope lookup ret
     });
 });
 
+test("group manager batches targeted sender key repair requests when batch api is available", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "bob";
+    manager.deviceId = "bob-web";
+    manager.groupEnvelopeRecoveryPromises = new Map();
+    const batchPayloads: any[] = [];
+    let fallbackCalls = 0;
+
+    manager.parent = {
+        lookupGroupSenderKeyEnvelope: async () => ({}),
+        requestGroupSenderKeyRepairBatch: async (payload: any) => {
+            batchPayloads.push(payload);
+        },
+        requestGroupSenderKeyRepair: async () => {
+            fallbackCalls += 1;
+        },
+    };
+
+    const results = await Promise.all([
+        manager.recoverSenderKeyFromEnvelope({ group_id: "group-1", key_id: 9 }, "alice", "alice-web"),
+        manager.recoverSenderKeyFromEnvelope({ group_id: "group-1", key_id: 10 }, "alice", "alice-web"),
+    ]);
+
+    assert.deepEqual(results, [false, false]);
+    assert.equal(fallbackCalls, 0);
+    assert.equal(batchPayloads.length, 1);
+    assert.deepEqual(batchPayloads[0], {
+        requests: [
+            {
+                group_id: "group-1",
+                sender_uid: "alice",
+                sender_device_id: "alice-web",
+                key_id: 9,
+                recipient_uid: "bob",
+                recipient_device_id: "bob-web",
+                reason: "missing_sender_key",
+            },
+            {
+                group_id: "group-1",
+                sender_uid: "alice",
+                sender_device_id: "alice-web",
+                key_id: 10,
+                recipient_uid: "bob",
+                recipient_device_id: "bob-web",
+                reason: "missing_sender_key",
+            },
+        ],
+    });
+});
+
 test("group manager prepareGroupSend uploads sender key only to pending repair devices", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
@@ -670,6 +720,65 @@ test("group manager prepareGroupSend uploads sender key only to pending repair d
     assert.deepEqual(builtMembers, [{ uid: "bob", devices: [{ device_id: "bob-web" }, { device_id: "bob-phone" }] }]);
     assert.equal(uploaded, 1);
     assert.equal(record.getState().messageIndex, 8);
+});
+
+test("group manager pending repair lookup uses bounded page and drains has_more in background", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+
+    const cached = new Set<string>();
+    manager.senderKeyRepairRequestCache = {
+        has: (key: string) => cached.has(key),
+        set: (key: string) => cached.add(key),
+        keys: () => Array.from(cached.keys()),
+        delete: (key: string) => cached.delete(key),
+    };
+
+    const requestedLimits: number[] = [];
+    let lookups = 0;
+    let uploads = 0;
+    manager.parent = {
+        lookupGroupSenderKeyRepairRequests: async (payload: any) => {
+            requestedLimits.push(payload.limit);
+            lookups++;
+            if (lookups === 1) {
+                return {
+                    has_more: true,
+                    requests: [{ recipient_uid: "bob", recipient_device_id: "bob-web-1" }],
+                };
+            }
+            return {
+                has_more: false,
+                requests: [{ recipient_uid: "bob", recipient_device_id: "bob-web-2" }],
+            };
+        },
+    };
+    manager.buildDistributionPayloadForRecord = async (_groupId: string, _record: any, members: any[]) => ({
+        key_id: 7,
+        member_hash: "members-v1",
+        distribution: {
+            type: "signal_multi",
+            ciphertexts: members.flatMap((member: any) =>
+                member.devices.map((device: any) => ({ uid: member.uid, device_id: device.device_id, body: "sender-key" })),
+            ),
+        },
+    });
+    manager.uploadDistributionEnvelopes = async () => {
+        uploads++;
+    };
+    const record = {
+        memberHash: "members-v1",
+        getState: () => ({ keyId: 7 }),
+    };
+
+    const repaired = await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+    await new Promise((resolve) => setTimeout(resolve, 180));
+
+    assert.equal(repaired, 1);
+    assert.deepEqual(requestedLimits, [500, 500]);
+    assert.equal(lookups, 2);
+    assert.equal(uploads, 2);
 });
 
 test("group manager encryptGroupMessage uploads pending repair envelopes before sending cached key", async () => {

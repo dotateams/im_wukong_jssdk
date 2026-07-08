@@ -57,11 +57,15 @@ export class ChatManager {
     private pendingRealtimeE2EEDecrypts: Map<string, PendingRealtimeE2EEDecrypt> = new Map()
     private pendingRealtimeE2EETimers: Map<string, any> = new Map()
     private pendingRealtimeE2EERetryDelays: number[] = [5000, 15000, 30000, 60000, 120000]
-    private pendingRealtimeE2EEMaxTTL: number = 10 * 60 * 1000
+    private pendingRealtimeE2EEMaxTTL: number = 5 * 60 * 1000
+    private pendingRealtimeE2EEMaxTotal: number = 2000
+    private pendingRealtimeE2EEMaxPerGroup: number = 200
+    private readonly e2eeDecryptingText: string = "消息解密中..."
+    private readonly e2eeDecryptFailedText: string = "消息无法解密"
     // 终态失败群消息登记表，等待 sender key 到达后原地重解密（无需刷新页面）。
     private failedGroupE2EEDecrypts: Map<string, FailedGroupE2EEDecrypt[]> = new Map()
-    private failedGroupE2EEMaxTotal: number = 200 // 全局上限（> repair 上限 100，覆盖首登回填一页）
-    private failedGroupE2EEMaxPerChannel: number = 50 // 单群上限，防止单群噪声挤占
+    private failedGroupE2EEMaxTotal: number = 2000 // 全局上限，覆盖多个大群短时间补 key 场景
+    private failedGroupE2EEMaxPerChannel: number = 200 // 单群上限，防止单群噪声挤占
     private failedGroupE2EETTL: number = 15 * 60 * 1000 // 略大于待解密队列 10min
 
     private static instance: ChatManager
@@ -321,8 +325,13 @@ export class ChatManager {
                 this.notifyMessageListeners(message)
                 return
             }
-            this.finalizeE2EEDecryptFailure(message, signalContent, result.error || firstError, { ...options, realtime: true })
-            this.addPendingRealtimeE2EEDecrypt(message, signalContent, context, result.error || firstError, { ...options, realtime: true })
+            const finalError = result.error || firstError
+            if (this.isRecoverableRealtimeE2EEError(finalError, message, signalContent, { ...options, realtime: true })) {
+                this.buildE2EEDecryptSkeletonContent(message)
+                this.addPendingRealtimeE2EEDecrypt(message, signalContent, context, finalError, { ...options, realtime: true })
+            } else {
+                this.finalizeE2EEDecryptFailure(message, signalContent, finalError, { ...options, realtime: true })
+            }
             this.notifyMessageListeners(message)
         }).finally(() => {
             if (this.realtimeE2EERetryChains.get(key) === chain) {
@@ -373,7 +382,34 @@ export class ChatManager {
         entry.error = error
         entry.options = options
         this.pendingRealtimeE2EEDecrypts.set(key, entry)
+        this.enforcePendingRealtimeE2EEDecryptCaps()
         this.schedulePendingRealtimeE2EERetry(entry)
+    }
+
+    private enforcePendingRealtimeE2EEDecryptCaps(): void {
+        const entries = Array.from(this.pendingRealtimeE2EEDecrypts.values())
+            .sort((a, b) => a.createdAt - b.createdAt)
+        const perGroupCount = new Map<string, number>()
+        for (let i = entries.length - 1; i >= 0; i--) {
+            const entry = entries[i]
+            const count = (perGroupCount.get(entry.groupKey) || 0) + 1
+            perGroupCount.set(entry.groupKey, count)
+            if (count > this.pendingRealtimeE2EEMaxPerGroup) {
+                this.finalizePendingRealtimeE2EEDecrypt(entry)
+            }
+        }
+        while (this.pendingRealtimeE2EEDecrypts.size > this.pendingRealtimeE2EEMaxTotal) {
+            let oldest: PendingRealtimeE2EEDecrypt | undefined
+            this.pendingRealtimeE2EEDecrypts.forEach((entry) => {
+                if (!oldest || entry.createdAt < oldest.createdAt) {
+                    oldest = entry
+                }
+            })
+            if (!oldest) {
+                return
+            }
+            this.finalizePendingRealtimeE2EEDecrypt(oldest)
+        }
     }
 
     private schedulePendingRealtimeE2EERetry(entry: PendingRealtimeE2EEDecrypt): void {
@@ -382,7 +418,7 @@ export class ChatManager {
         }
         const age = Date.now() - entry.createdAt
         if (age > this.pendingRealtimeE2EEMaxTTL) {
-            this.pendingRealtimeE2EEDecrypts.delete(entry.key)
+            this.finalizePendingRealtimeE2EEDecrypt(entry)
             return
         }
         const delay = this.pendingRealtimeE2EERetryDelays[
@@ -404,7 +440,7 @@ export class ChatManager {
 
     private async retryOnePendingE2EEDecrypt(entry: PendingRealtimeE2EEDecrypt): Promise<boolean> {
         if (Date.now() - entry.createdAt > this.pendingRealtimeE2EEMaxTTL) {
-            this.clearPendingRealtimeE2EEDecrypt(entry.key)
+            this.finalizePendingRealtimeE2EEDecrypt(entry)
             return false
         }
         entry.attempts++
@@ -420,6 +456,12 @@ export class ChatManager {
             }
             return false
         }
+    }
+
+    private finalizePendingRealtimeE2EEDecrypt(entry: PendingRealtimeE2EEDecrypt): void {
+        this.clearPendingRealtimeE2EEDecrypt(entry.key)
+        this.finalizeE2EEDecryptFailure(entry.message, entry.signalContent, entry.error, entry.options)
+        this.notifyMessageListeners(entry.message)
     }
 
     // attemptInPlaceRedecrypt 先尝试恢复缺失的群 sender key，再原地重解密该消息并更新其状态；
@@ -766,7 +808,9 @@ export class ChatManager {
     private buildE2EEDecryptSkeletonContent(message: Message) {
         ;(message as any).e2eePendingDecrypt = true
         ;(message as any).e2eeDecryptFailed = false
-        message.content = new MessageText("[E2EE] 正在解密...")
+        const content = new MessageText(this.e2eeDecryptingText)
+        ;(content as any).e2eeDecryptState = "pending"
+        message.content = content
     }
 
     private isRecoverableRealtimeE2EEError(error: any, targetMessage?: Message, signalContent?: MessageSignalContent, options: DecryptMessageOptions = {}): boolean {
@@ -884,13 +928,9 @@ export class ChatManager {
     }
 
     buildE2EEDecryptFailureContent(error: any, options: DecryptMessageOptions = {}): MessageText {
-        if (this.isMissingSenderKeyError(error)) {
-            if (this.isRecoverableE2EEPath(options)) {
-                return new MessageText("[E2EE] 当前消息缺少群密钥，暂时无法解密")
-            }
-            return new MessageText("[E2EE] 该历史消息缺少群密钥，无法在当前设备解密")
-        }
-        return new MessageText("[E2EE] 消息无法解密或无权限查看")
+        const content = new MessageText(this.e2eeDecryptFailedText)
+        ;(content as any).e2eeDecryptState = "failed"
+        return content
     }
 
     isSignalMessageContent(content: MessageContent | any): boolean {

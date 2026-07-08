@@ -73,6 +73,13 @@ function resetSdk() {
     (sdk.chatManager as any).pendingRealtimeE2EEDecrypts?.clear?.();
     (sdk.chatManager as any).pendingRealtimeE2EETimers?.clear?.();
     (sdk.chatManager as any).failedGroupE2EEDecrypts?.clear?.();
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [300, 800, 1500, 3000];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 5;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 30 * 1000;
+    (sdk.chatManager as any).pendingRealtimeE2EERetryDelays = [5000, 15000, 30000, 60000, 120000];
+    (sdk.chatManager as any).pendingRealtimeE2EEMaxTTL = 5 * 60 * 1000;
+    (sdk.chatManager as any).pendingRealtimeE2EEMaxTotal = 2000;
+    (sdk.chatManager as any).pendingRealtimeE2EEMaxPerGroup = 200;
     try {
         (globalThis as any).localStorage?.clear?.();
         (globalThis as any).sessionStorage?.clear?.();
@@ -1096,7 +1103,7 @@ test("e2ee_chat_manager suppresses repeated missing sender key errors for the sa
 
             assert.equal((message as any).e2eeDecryptFailed, true);
             assert.equal(message.content.contentType, MessageContentType.text);
-            assert.ok((message.content as MessageText).text.indexOf("群密钥") >= 0);
+            assert.equal((message.content as MessageText).text, "消息无法解密");
         }
     } finally {
         console.error = oldError;
@@ -1799,7 +1806,8 @@ test("e2ee_chat_manager undecryptable signal content marks failure state", async
 
     assert.equal((message as any).e2eeDecryptFailed, true);
     assert.ok(message.content instanceof MessageText);
-    assert.equal((message.content as MessageText).text, "[E2EE] 消息无法解密或无权限查看");
+    assert.equal((message.content as MessageText).text, "消息无法解密");
+    assert.equal((message.content as any).e2eeDecryptState, "failed");
     assert.equal(errors.length, 1);
     assert.equal(errors[0][0], "[E2EE] decrypt failed");
 });
@@ -1927,7 +1935,53 @@ test("e2ee_chat_manager realtime recoverable failures become final after retry l
     assert.equal((message as any).e2eePendingDecrypt, false);
     assert.equal((message as any).e2eeDecryptFailed, true);
     assert.ok(message.content instanceof MessageText);
-    assert.ok((message.content as MessageText).text.indexOf("群密钥") >= 0);
+    assert.equal((message.content as MessageText).text, "消息无法解密");
+    assert.equal((message.content as any).e2eeDecryptState, "failed");
+});
+
+test("e2ee_chat_manager recoverable realtime group failures show user friendly decrypting placeholder", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "member-1";
+    message.messageSeq = 10;
+    message.content = signalContent("signal_group");
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                throw new Error("Missing sender key");
+            },
+            recoverDecryptFailure: async () => false,
+        } as any,
+    });
+    (sdk.chatManager as any).realtimeE2EERetryDelays = [10000];
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 1;
+    (sdk.chatManager as any).realtimeE2EEPendingTTL = 60000;
+
+    await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
+
+    assert.equal((message as any).e2eePendingDecrypt, true);
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.ok(message.content instanceof MessageText);
+    assert.equal((message.content as MessageText).text, "消息解密中...");
+    assert.equal((message.content as any).e2eeDecryptState, "pending");
+    assert.equal((message.content as MessageText).text.includes("E2EE"), false);
+});
+
+test("e2ee_chat_manager final decrypt failures hide technical E2EE wording", () => {
+    const sdk = resetSdk();
+    const finalContent = sdk.chatManager.buildE2EEDecryptFailureContent(new Error("Missing sender key"), { realtime: false } as any);
+    const genericContent = sdk.chatManager.buildE2EEDecryptFailureContent(new Error("bad ciphertext"), {} as any);
+
+    assert.equal(finalContent.text, "消息无法解密");
+    assert.equal(genericContent.text, "消息无法解密");
+    assert.equal(finalContent.text.includes("E2EE"), false);
+    assert.equal(genericContent.text.includes("E2EE"), false);
+    assert.equal((finalContent as any).e2eeDecryptState, "failed");
 });
 
 test("e2ee_chat_manager realtime deferred retry delivers skeleton before background recovery", async () => {
@@ -1973,7 +2027,8 @@ test("e2ee_chat_manager realtime deferred retry delivers skeleton before backgro
         await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
         assert.equal(decryptCalls, 1);
         assert.equal((message as any).e2eePendingDecrypt, true);
-        assert.equal((message.content as MessageText).text, "[E2EE] 正在解密...");
+        assert.equal((message.content as MessageText).text, "消息解密中...");
+        assert.equal((message.content as any).e2eeDecryptState, "pending");
         await waitFor(() => assert.equal((message.content as MessageText).text, "background recovered"));
     } finally {
         console.error = originalError;
@@ -1982,7 +2037,8 @@ test("e2ee_chat_manager realtime deferred retry delivers skeleton before backgro
 
     assert.equal(decryptCalls, 3);
     assert.equal(recoverCalls, 2);
-    assert.equal(notified.length, 1);
+    assert.ok(notified.length >= 1);
+    assert.equal(notified[notified.length - 1], message);
     assert.equal(notified[0], message);
     assert.equal((message as any).e2eePendingDecrypt, false);
     assert.equal((message as any).e2eeDecryptFailed, false);
@@ -2014,6 +2070,7 @@ test("e2ee_chat_manager realtime deferred final failure does not use history wor
     (sdk.chatManager as any).realtimeE2EERetryDelays = [1, 1];
     (sdk.chatManager as any).realtimeE2EEMaxAttempts = 2;
     (sdk.chatManager as any).realtimeE2EEPendingTTL = 1000;
+    (sdk.chatManager as any).pendingRealtimeE2EEMaxTTL = 1;
     (sdk.chatManager as any).notifyMessageListeners = (item: Message) => {
         notified.push(item);
     };
@@ -2022,17 +2079,22 @@ test("e2ee_chat_manager realtime deferred final failure does not use history wor
         console.error = () => undefined;
         await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
         assert.equal((message as any).e2eePendingDecrypt, true);
+        await waitFor(() => assert.equal((sdk.chatManager as any).pendingRealtimeE2EEDecrypts.size, 1));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await (sdk.chatManager as any).retryPendingE2EEDecrypts();
         await waitFor(() => assert.equal((message as any).e2eeDecryptFailed, true));
     } finally {
         console.error = originalError;
         (sdk.chatManager as any).notifyMessageListeners = originalNotify;
     }
 
-    assert.equal(notified.length, 1);
+    assert.ok(notified.length >= 1);
+    assert.equal(notified[notified.length - 1], message);
     assert.equal((message as any).e2eePendingDecrypt, false);
     assert.equal((message as any).e2eeDecryptFailed, true);
     assert.ok(message.content instanceof MessageText);
-    assert.ok(!(message.content as MessageText).text.includes("历史消息"));
+    assert.equal((message.content as MessageText).text, "消息无法解密");
+    assert.equal((message.content as any).e2eeDecryptState, "failed");
 });
 
 test("e2ee_chat_manager retries pending realtime group decrypt after sender key arrives late", async () => {
@@ -2073,7 +2135,8 @@ test("e2ee_chat_manager retries pending realtime group decrypt after sender key 
     try {
         console.error = () => undefined;
         await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
-        await waitFor(() => assert.equal((message as any).e2eeDecryptFailed, true));
+        await waitFor(() => assert.equal((message as any).e2eePendingDecrypt, true));
+        await waitFor(() => assert.equal((sdk.chatManager as any).pendingRealtimeE2EEDecrypts.size, 1));
 
         keyReady = true;
         const recovered = await (sdk.chatManager as any).retryPendingE2EEDecrypts();
@@ -2140,7 +2203,8 @@ test("e2ee_chat_manager retries pending realtime group decrypt immediately after
     try {
         console.error = () => undefined;
         await sdk.chatManager.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true } as any);
-        await waitFor(() => assert.equal((message as any).e2eeDecryptFailed, true));
+        await waitFor(() => assert.equal((message as any).e2eePendingDecrypt, true));
+        await waitFor(() => assert.equal((sdk.chatManager as any).pendingRealtimeE2EEDecrypts.size, 1));
 
         await sdk.chatManager.decryptMessageIfNeeded(distribution, { realtime: true } as any);
     } finally {
