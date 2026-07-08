@@ -232,7 +232,7 @@ export class ConnectManager {
 
     unpacket(data: Uint8Array, callback: (data: Array<Array<number>>) => void) {
         try {
-            this.tempBufferData.push(...Array.from(data))
+            this.appendTempBufferData(data)
 
             let lenBefore, lenAfter
             const dataList = new Array<Array<number>>()
@@ -243,7 +243,7 @@ export class ConnectManager {
                 })
                 lenAfter = this.tempBufferData.length;
                 if (lenAfter > 0) {
-                    console.log("有粘包！-->", this.tempBufferData)
+                    console.log("有粘包！剩余字节数-->", lenAfter)
                 }
                
             } while (lenBefore != lenAfter && lenAfter >= 1)
@@ -253,6 +253,12 @@ export class ConnectManager {
         } catch (error) {
             console.log("解码数据异常---->", error)
             this.reConnect()
+        }
+    }
+
+    private appendTempBufferData(data: Uint8Array) {
+        for (let i = 0; i < data.length; i++) {
+            this.tempBufferData.push(data[i])
         }
     }
 
