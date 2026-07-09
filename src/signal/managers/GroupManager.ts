@@ -26,6 +26,8 @@ export class GroupManager {
   private senderKeyRepairRequestCache: SmartLRUCache<string, boolean>;
   private senderKeyRepairBatchQueue: Map<string, any>;
   private senderKeyRepairBatchTimer: any;
+  private senderKeyEnvelopeLookupBatchQueue: Map<string, any>;
+  private senderKeyEnvelopeLookupBatchTimer: any;
   private readonly senderKeyDistributionRetryWindow = 1;
   private readonly senderKeyDistributionInterval: number;
   private readonly senderKeyEnvelopeRecoveryMaxAttempts: number;
@@ -46,6 +48,8 @@ export class GroupManager {
     this.senderKeyEnvelopeUploadPromises = new Map();
     this.senderKeyRepairBatchQueue = new Map();
     this.senderKeyRepairBatchTimer = null;
+    this.senderKeyEnvelopeLookupBatchQueue = new Map();
+    this.senderKeyEnvelopeLookupBatchTimer = null;
     this.identityRepairGeneration = 0;
     this.identityRepairDistributionGroups = new Set();
     this.firstLoginGraceUntil = 0;
@@ -1177,6 +1181,9 @@ export class GroupManager {
     let lastError: any = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
+        if (this.parent && typeof this.parent.lookupGroupSenderKeyEnvelopeBatch === 'function') {
+          return await this.enqueueGroupSenderKeyEnvelopeLookup(payload);
+        }
         return await this.parent.lookupGroupSenderKeyEnvelope(payload);
       } catch (error) {
         lastError = error;
@@ -1187,6 +1194,81 @@ export class GroupManager {
       }
     }
     throw lastError;
+  }
+
+  private enqueueGroupSenderKeyEnvelopeLookup(payload: any): Promise<any> {
+    const cacheKey = this.groupSenderKeyEnvelopeLookupCacheKey(payload);
+    return new Promise((resolve, reject) => {
+      const existing = this.senderKeyEnvelopeLookupBatchQueue.get(cacheKey);
+      if (existing) {
+        existing.resolvers.push(resolve);
+        existing.rejecters.push(reject);
+      } else {
+        this.senderKeyEnvelopeLookupBatchQueue.set(cacheKey, {
+          payload,
+          resolvers: [resolve],
+          rejecters: [reject],
+        });
+      }
+      if (this.senderKeyEnvelopeLookupBatchQueue.size >= 50) {
+        this.flushGroupSenderKeyEnvelopeLookupBatchQueue();
+        return;
+      }
+      if (!this.senderKeyEnvelopeLookupBatchTimer) {
+        this.senderKeyEnvelopeLookupBatchTimer = setTimeout(() => {
+          this.senderKeyEnvelopeLookupBatchTimer = null;
+          this.flushGroupSenderKeyEnvelopeLookupBatchQueue();
+        }, 25);
+      }
+    });
+  }
+
+  private async flushGroupSenderKeyEnvelopeLookupBatchQueue(): Promise<void> {
+    if (!this.senderKeyEnvelopeLookupBatchQueue || this.senderKeyEnvelopeLookupBatchQueue.size <= 0) {
+      return;
+    }
+    if (this.senderKeyEnvelopeLookupBatchTimer) {
+      clearTimeout(this.senderKeyEnvelopeLookupBatchTimer);
+      this.senderKeyEnvelopeLookupBatchTimer = null;
+    }
+    const entries = Array.from(this.senderKeyEnvelopeLookupBatchQueue.values());
+    this.senderKeyEnvelopeLookupBatchQueue.clear();
+    const requests = entries.map((entry) => entry.payload);
+    try {
+      const resp = await this.parent.lookupGroupSenderKeyEnvelopeBatch({ requests });
+      const results = Array.isArray(resp?.results) ? resp.results : [];
+      const byKey = new Map<string, any>();
+      results.forEach((item: any) => {
+        if (item && item.request) {
+          byKey.set(this.groupSenderKeyEnvelopeLookupCacheKey(item.request), item);
+        }
+      });
+      entries.forEach((entry) => {
+        const result = byKey.get(this.groupSenderKeyEnvelopeLookupCacheKey(entry.payload));
+        const value = result?.found ? result.envelope : null;
+        entry.resolvers.forEach((resolve: any) => resolve(value));
+      });
+    } catch (error) {
+      await Promise.all(entries.map(async (entry) => {
+        try {
+          const fallback = await this.parent.lookupGroupSenderKeyEnvelope(entry.payload);
+          entry.resolvers.forEach((resolve: any) => resolve(fallback));
+        } catch (fallbackError) {
+          entry.rejecters.forEach((reject: any) => reject(fallbackError));
+        }
+      }));
+    }
+  }
+
+  private groupSenderKeyEnvelopeLookupCacheKey(payload: any): string {
+    return [
+      payload?.group_id || '',
+      payload?.sender_uid || '',
+      payload?.sender_device_id || '',
+      payload?.key_id || '',
+      payload?.recipient_uid || '',
+      payload?.recipient_device_id || '',
+    ].join('\x00');
   }
 
   private isPermanentEnvelopeLookupError(error: any): boolean {

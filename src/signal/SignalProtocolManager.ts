@@ -353,6 +353,14 @@ export class SignalProtocolManager {
     return this.getResponseData(resp)
   }
 
+  async lookupGroupSenderKeyEnvelopeBatch(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    const resp = await this.apiClient.post('/e2e/group_sender_keys/envelope/lookup/batch', payload)
+    return this.getResponseData(resp)
+  }
+
   async requestGroupSenderKeyRepair(payload: any) {
     if (!this.apiClient || typeof this.apiClient.post !== 'function') {
       return null
