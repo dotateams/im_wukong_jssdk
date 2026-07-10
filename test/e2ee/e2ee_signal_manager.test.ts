@@ -783,6 +783,41 @@ test("group manager pending repair lookup uses bounded page and drains has_more 
     assert.equal(uploads, 2);
 });
 
+test("group manager throttles empty pending repair lookups until cache invalidation", async () => {
+    const manager: any = Object.create(GroupManager.prototype);
+    manager.uid = "alice";
+    manager.deviceId = "alice-web";
+
+    let lookups = 0;
+    manager.parent = {
+        lookupGroupSenderKeyRepairRequests: async () => {
+            lookups++;
+            return { has_more: false, requests: [] };
+        },
+    };
+    manager.buildDistributionPayloadForRecord = async () => {
+        throw new Error("empty repair lookup should not build distribution");
+    };
+    manager.uploadDistributionEnvelopes = async () => {
+        throw new Error("empty repair lookup should not upload distribution");
+    };
+    const record = {
+        memberHash: "members-v1",
+        getState: () => ({ keyId: 7 }),
+    };
+
+    await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+    await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+    await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+
+    assert.equal(lookups, 1);
+
+    manager.invalidateGroupRepairRequestCache("group-1");
+    await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+
+    assert.equal(lookups, 2);
+});
+
 test("group manager encryptGroupMessage uploads pending repair envelopes before sending cached key", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
@@ -1087,7 +1122,7 @@ test("group manager retries sender key envelope upload after a failed cached att
     assert.equal(uploads, 2);
 });
 
-test("group manager does not suppress later sender key repair after an empty lookup", async () => {
+test("group manager retries sender key repair after empty lookup cache is invalidated", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "alice";
     manager.deviceId = "alice-web";
@@ -1096,6 +1131,8 @@ test("group manager does not suppress later sender key repair after an empty loo
     manager.senderKeyRepairRequestCache = {
         has: (key: string) => cached.has(key),
         set: (key: string) => cached.add(key),
+        keys: () => Array.from(cached.keys()),
+        delete: (key: string) => cached.delete(key),
     };
 
     let lookups = 0;
@@ -1129,6 +1166,8 @@ test("group manager does not suppress later sender key repair after an empty loo
     };
 
     await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+    await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
+    manager.invalidateGroupRepairRequestCache("group-1");
     await manager.uploadPendingRepairEnvelopes("group-1", record, "members-v1");
 
     assert.equal(lookups, 2);

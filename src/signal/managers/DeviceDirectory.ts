@@ -17,7 +17,9 @@ export class DeviceDirectory {
   channelDevicesCache: Map<any, any>
   channelDevicesInFlight: Map<any, any>
   channelDevicesRefreshGeneration: Map<any, number>
+  channelDevicesVersionCheckedAt: Map<any, number>
   channelDevicesCacheTtlMs: number
+  channelDevicesVersionCheckIntervalMs: number
 
   constructor(
     apiClient: any,
@@ -36,8 +38,10 @@ export class DeviceDirectory {
     this.channelDevicesCache = new Map()
     this.channelDevicesInFlight = new Map()
     this.channelDevicesRefreshGeneration = new Map()
+    this.channelDevicesVersionCheckedAt = new Map()
     // 0 means long-lived. It is invalidated by member changes or forceRefresh.
     this.channelDevicesCacheTtlMs = 0
+    this.channelDevicesVersionCheckIntervalMs = 30 * 1000
   }
 
   async getRemoteDevices(uid: string, forceRefresh?: boolean) {
@@ -106,6 +110,9 @@ export class DeviceDirectory {
       const cached = this.getChannelDevicesCacheEntry(cacheKey)
       if (cached && Array.isArray(cached.devices) && !this.isChannelDevicesCacheExpired(cached)) {
         if (options && options.awaitFreshness) {
+          if (!this.shouldCheckChannelDevicesVersion(cacheKey)) {
+            return cached.devices
+          }
           // 同步校验版本并按需刷新（只在版本变化时才全量拉设备），保证分发使用最新设备集。
           const generation = this.channelDevicesRefreshGeneration.get(cacheKey) || 0
           try {
@@ -149,6 +156,7 @@ export class DeviceDirectory {
     keys.forEach((cacheKey) => {
       this.channelDevicesCache.delete(cacheKey)
       this.channelDevicesInFlight.delete(cacheKey)
+      this.channelDevicesVersionCheckedAt.delete(cacheKey)
       this.channelDevicesRefreshGeneration.set(cacheKey, (this.channelDevicesRefreshGeneration.get(cacheKey) || 0) + 1)
       this.removePersistentChannelDevices(cacheKey)
     })
@@ -160,11 +168,15 @@ export class DeviceDirectory {
     this.channelDevicesCache.clear()
     this.channelDevicesInFlight.clear()
     this.channelDevicesRefreshGeneration.clear()
+    this.channelDevicesVersionCheckedAt.clear()
     this.clearPersistentChannelDevices()
   }
 
   private scheduleChannelDevicesRefresh(channelId: string, channelType: any, cacheKey: string) {
     if (this.channelDevicesInFlight.has(cacheKey)) {
+      return
+    }
+    if (!this.shouldCheckChannelDevicesVersion(cacheKey)) {
       return
     }
     const generation = this.channelDevicesRefreshGeneration.get(cacheKey) || 0
@@ -224,11 +236,13 @@ export class DeviceDirectory {
       }
       this.channelDevicesCache.set(cacheKey, entry)
       this.setPersistentChannelDevices(cacheKey, entry)
+      this.markChannelDevicesVersionChecked(cacheKey)
     }
     return normalized
   }
 
   private async validateChannelDevicesVersionAndRefresh(channelId: string, channelType: any, cacheKey: string, generation: number, refreshWhenVersionMissing?: boolean) {
+    this.markChannelDevicesVersionChecked(cacheKey)
     const cached = this.getChannelDevicesCacheEntry(cacheKey)
     if (!cached) {
       return await this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation)
@@ -272,6 +286,16 @@ export class DeviceDirectory {
     } catch (error) {
       return null
     }
+  }
+
+  private shouldCheckChannelDevicesVersion(cacheKey: string) {
+    const lastAt = this.channelDevicesVersionCheckedAt.get(cacheKey) || 0
+    const interval = Math.max(0, Number(this.channelDevicesVersionCheckIntervalMs || 0))
+    return !lastAt || interval <= 0 || Date.now() - lastAt >= interval
+  }
+
+  private markChannelDevicesVersionChecked(cacheKey: string) {
+    this.channelDevicesVersionCheckedAt.set(cacheKey, Date.now())
   }
 
   private normalizeChannelDevices(data: any) {

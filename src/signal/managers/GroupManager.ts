@@ -602,10 +602,12 @@ export class GroupManager {
     }
     const requests = this.normalizeRepairRequests(resp);
     if (requests.length === 0) {
+      cache.set(cacheKey, true);
       return 0;
     }
     const members = this.repairRequestsToMembers(requests);
     if (members.length === 0) {
+      cache.set(cacheKey, true);
       return 0;
     }
     const distribution = await this.buildDistributionPayloadForRecord(groupId, record, members, memberHash || record.memberHash || '');

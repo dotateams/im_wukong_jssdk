@@ -45,6 +45,7 @@ test("device directory returns long-lived channel device cache without TTL expir
       return { code: 0, data: [{ uid: "u1", e2e_devices: [{ device_id: "d1" }] }] };
     },
   }, ok, data, { uid: "alice", deviceId: "web-a" });
+  (directory as any).channelDevicesVersionCheckIntervalMs = 0;
 
   const first = await directory.getChanelSubscribersDevices("group1", 2);
   const second = await directory.getChanelSubscribersDevices("group1", 2);
@@ -97,6 +98,7 @@ test("device directory returns stale cache immediately and refreshes channel dev
       return refresh.promise;
     },
   }, ok, data, { uid: "alice", deviceId: "web-a" });
+  (directory as any).channelDevicesVersionCheckIntervalMs = 0;
 
   await directory.getChanelSubscribersDevices("group1", 2);
   const cached = await directory.getChanelSubscribersDevices("group1", 2);
@@ -124,6 +126,7 @@ test("device directory deduplicates same-channel refresh requests", async () => 
       return request.promise;
     },
   }, ok, data, { uid: "alice", deviceId: "web-a" });
+  (directory as any).channelDevicesVersionCheckIntervalMs = 0;
 
   const a = directory.getChanelSubscribersDevices("group1", 2, true);
   const b = directory.getChanelSubscribersDevices("group1", 2, true);
@@ -148,6 +151,7 @@ test("device directory keeps cached devices when background version is unchanged
       return { code: 0, data: { member_version: 1, devices_version: 1, devices: [{ uid: "u1", devices: [{ device_id: "d1" }] }] } };
     },
   }, ok, data, { uid: "alice", deviceId: "web-a" });
+  (directory as any).channelDevicesVersionCheckIntervalMs = 0;
 
   await directory.getChanelSubscribersDevices("group1", 2);
   await directory.getChanelSubscribersDevices("group1", 2);
@@ -203,6 +207,7 @@ test("awaitFreshness synchronously picks up a newly registered device on cache h
       return { code: 0, data: { member_version: 1, devices_version: 2, devices: [{ uid: "u1", devices: [{ device_id: "old", identity_key: "ik-old" }, { device_id: "new", identity_key: "ik-new" }] }] } };
     },
   }, ok, data, { uid: "alice", deviceId: "web-a" });
+  (directory as any).channelDevicesVersionCheckIntervalMs = 0;
 
   const first = await directory.getChanelSubscribersDevices("group1", 2);
   assert.deepEqual(first[0].devices.map((d: any) => d.device_id), ["old"]);
@@ -226,6 +231,7 @@ test("awaitFreshness returns cached devices without full refetch when version un
       return { code: 0, data: { member_version: 1, devices_version: 1, devices: [{ uid: "u1", devices: [{ device_id: "d1" }] }] } };
     },
   }, ok, data, { uid: "alice", deviceId: "web-a" });
+  (directory as any).channelDevicesVersionCheckIntervalMs = 0;
 
   await directory.getChanelSubscribersDevices("group1", 2);
   const fresh = await directory.getChanelSubscribersDevices("group1", 2, false, { awaitFreshness: true });
@@ -233,6 +239,35 @@ test("awaitFreshness returns cached devices without full refetch when version un
   assert.equal(versionCalls, 1);
   assert.equal(fullCalls, 1);
   assert.deepEqual(fresh[0].devices, [{ device_id: "d1" }]);
+});
+
+test("awaitFreshness throttles repeated channel device version checks until invalidated", async () => {
+  let fullCalls = 0;
+  let versionCalls = 0;
+  const directory = new DeviceDirectory({
+    get: async (url: string) => {
+      if (url.indexOf("/version") >= 0) {
+        versionCalls++;
+        return { code: 0, data: { member_version: 1, devices_version: 1 } };
+      }
+      fullCalls++;
+      return { code: 0, data: { member_version: 1, devices_version: 1, devices: [{ uid: "u1", devices: [{ device_id: `d${fullCalls}` }] }] } };
+    },
+  }, ok, data, { uid: "alice", deviceId: "web-a" });
+
+  await directory.getChanelSubscribersDevices("group1", 2);
+  await directory.getChanelSubscribersDevices("group1", 2, false, { awaitFreshness: true });
+  await directory.getChanelSubscribersDevices("group1", 2, false, { awaitFreshness: true });
+  await directory.getChanelSubscribersDevices("group1", 2, false, { awaitFreshness: true });
+
+  assert.equal(versionCalls, 0);
+  assert.equal(fullCalls, 1);
+
+  directory.invalidateChannelDevicesCache("group1", 2);
+  const refreshed = await directory.getChanelSubscribersDevices("group1", 2, false, { awaitFreshness: true });
+
+  assert.equal(fullCalls, 2);
+  assert.deepEqual(refreshed[0].devices, [{ device_id: "d2" }]);
 });
 
 test("awaitFreshness falls back to full device refresh when version probe fails", async () => {
@@ -251,6 +286,7 @@ test("awaitFreshness falls back to full device refresh when version probe fails"
       return { code: 0, data: { member_version: 1, devices_version: 2, devices: [{ uid: "u1", devices: [{ device_id: "old" }, { device_id: "new" }] }] } };
     },
   }, ok, data, { uid: "alice", deviceId: "web-a" });
+  (directory as any).channelDevicesVersionCheckIntervalMs = 0;
 
   await directory.getChanelSubscribersDevices("group1", 2);
   const fresh = await directory.getChanelSubscribersDevices("group1", 2, false, { awaitFreshness: true });
