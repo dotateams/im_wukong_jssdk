@@ -65,6 +65,9 @@ export class ChatManager {
     private readonly e2eeDecryptFailedText: string = "消息无法解密"
     // 终态失败群消息登记表，等待 sender key 到达后原地重解密（无需刷新页面）。
     private failedGroupE2EEDecrypts: Map<string, FailedGroupE2EEDecrypt[]> = new Map()
+    private failedGroupE2EERetryTimers: Map<string, any> = new Map()
+    private failedGroupE2EERetryAttempts: Map<string, number> = new Map()
+    private failedGroupE2EERetryDelays: number[] = [15000, 30000, 60000, 120000]
     private failedGroupE2EEMaxTotal: number = 2000 // 全局上限，覆盖多个大群短时间补 key 场景
     private failedGroupE2EEMaxPerChannel: number = 200 // 单群上限，防止单群噪声挤占
     private failedGroupE2EETTL: number = 15 * 60 * 1000 // 略大于待解密队列 10min
@@ -676,6 +679,7 @@ export class ChatManager {
         }
         this.failedGroupE2EEDecrypts.set(channelKey, list)
         this.enforceFailedGroupE2EEGlobalCap()
+        this.scheduleFailedGroupE2EERetry(channelKey)
     }
 
     private failedGroupE2EETotal(): number {
@@ -691,6 +695,7 @@ export class ChatManager {
             const kept = list.filter((item) => now - item.failedAt <= this.failedGroupE2EETTL)
             if (kept.length === 0) {
                 this.failedGroupE2EEDecrypts.delete(channelKey)
+                this.clearFailedGroupE2EERetryTimer(channelKey)
             } else if (kept.length !== list.length) {
                 this.failedGroupE2EEDecrypts.set(channelKey, kept)
             }
@@ -715,6 +720,7 @@ export class ChatManager {
             list.shift()
             if (list.length === 0) {
                 this.failedGroupE2EEDecrypts.delete(oldestChannel)
+                this.clearFailedGroupE2EERetryTimer(oldestChannel)
             }
         }
     }
@@ -746,7 +752,44 @@ export class ChatManager {
                 }
             }
         }
+        this.rescheduleFailedGroupE2EERetries(matchKey)
         return recovered
+    }
+
+    private scheduleFailedGroupE2EERetry(channelKey: string): void {
+        if (!channelKey || this.failedGroupE2EERetryTimers.get(channelKey)) {
+            return
+        }
+        const list = this.failedGroupE2EEDecrypts.get(channelKey)
+        if (!list || list.length === 0) {
+            this.failedGroupE2EERetryAttempts.delete(channelKey)
+            return
+        }
+        const attempt = this.failedGroupE2EERetryAttempts.get(channelKey) || 0
+        const delays = this.failedGroupE2EERetryDelays && this.failedGroupE2EERetryDelays.length > 0
+            ? this.failedGroupE2EERetryDelays
+            : [30000]
+        const delay = delays[Math.min(attempt, delays.length - 1)] || delays[delays.length - 1] || 30000
+        const timer = setTimeout(async () => {
+            this.failedGroupE2EERetryTimers.delete(channelKey)
+            this.failedGroupE2EERetryAttempts.set(channelKey, attempt + 1)
+            await this.retryFailedGroupE2EEDecrypts(channelKey)
+        }, delay)
+        this.failedGroupE2EERetryTimers.set(channelKey, timer)
+    }
+
+    private rescheduleFailedGroupE2EERetries(matchKey?: string): void {
+        if (matchKey) {
+            if (this.failedGroupE2EEDecrypts.has(matchKey)) {
+                this.scheduleFailedGroupE2EERetry(matchKey)
+            } else {
+                this.failedGroupE2EERetryAttempts.delete(matchKey)
+            }
+            return
+        }
+        this.failedGroupE2EEDecrypts.forEach((_list, channelKey) => {
+            this.scheduleFailedGroupE2EERetry(channelKey)
+        })
     }
 
     private removeFailedGroupE2EEDecrypt(entry: FailedGroupE2EEDecrypt): void {
@@ -757,8 +800,18 @@ export class ChatManager {
         const next = list.filter((item) => item.key !== entry.key)
         if (next.length === 0) {
             this.failedGroupE2EEDecrypts.delete(entry.channelKey)
+            this.clearFailedGroupE2EERetryTimer(entry.channelKey)
         } else {
             this.failedGroupE2EEDecrypts.set(entry.channelKey, next)
+        }
+    }
+
+    private clearFailedGroupE2EERetryTimer(channelKey: string): void {
+        this.failedGroupE2EERetryAttempts.delete(channelKey)
+        const timer = this.failedGroupE2EERetryTimers.get(channelKey)
+        if (timer) {
+            clearTimeout(timer)
+            this.failedGroupE2EERetryTimers.delete(channelKey)
         }
     }
 

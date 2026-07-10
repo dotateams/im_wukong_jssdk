@@ -23,6 +23,9 @@ function resetSdk() {
     (sdk.chatManager as any).pendingRealtimeE2EEDecrypts?.clear?.();
     (sdk.chatManager as any).pendingRealtimeE2EETimers?.clear?.();
     (sdk.chatManager as any).failedGroupE2EEDecrypts?.clear?.();
+    (sdk.chatManager as any).failedGroupE2EERetryTimers?.forEach?.((timer: any) => clearTimeout(timer));
+    (sdk.chatManager as any).failedGroupE2EERetryTimers?.clear?.();
+    (sdk.chatManager as any).failedGroupE2EERetryAttempts?.clear?.();
     try {
         (globalThis as any).localStorage?.clear?.();
         (globalThis as any).sessionStorage?.clear?.();
@@ -149,6 +152,48 @@ test("e2ee group self-heal: devices-changed CMD re-decrypts previously failed me
     let total = 0;
     tracked.forEach((list) => { total += list.length; });
     assert.equal(total, 0, "healed entry should be removed from registry");
+});
+
+test("e2ee group self-heal: terminal failed message retries without waiting for control CMD", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("g-heal-auto", ChannelTypeGroup);
+    cacheChannelInfo(channel, true);
+
+    let keyReady = false;
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                if (!keyReady) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText("auto healed plaintext");
+            },
+            recoverDecryptFailure: async () => keyReady,
+        },
+    });
+
+    const message = newGroupMessage(channel, "heal-auto-msg-1");
+    const signalContent = message.content as MessageSignalContent;
+    const chatManager = sdk.chatManager as any;
+    chatManager.failedGroupE2EERetryDelays = [20];
+    chatManager.trackFailedGroupE2EEDecrypt(message, signalContent, new Error("Missing sender key"));
+
+    const notified: Message[] = [];
+    const originalNotify = sdk.chatManager.notifyMessageListeners;
+    (sdk.chatManager as any).notifyMessageListeners = (m: Message) => { notified.push(m); };
+    try {
+        keyReady = true;
+        await new Promise((resolve) => setTimeout(resolve, 80));
+    } finally {
+        (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+
+    assert.ok(message.content instanceof MessageText, "message should be re-decrypted by background retry");
+    assert.equal((message.content as MessageText).text, "auto healed plaintext");
+    assert.equal((message as any).e2eeDecryptFailed, false);
+    assert.ok(notified.some((m) => m.messageID === "heal-auto-msg-1"), "listeners should be notified after background heal");
 });
 
 test("e2ee group self-heal: registry enforces per-channel cap", async () => {
