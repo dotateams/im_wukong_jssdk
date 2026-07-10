@@ -21,6 +21,7 @@ export class GroupManager {
   private senderKeyStateCache: SmartLRUCache<string, any>;
   private senderKeyEnvelopeUploadCache: SmartLRUCache<string, boolean>;
   private senderKeyEnvelopeUploadPromises: Map<string, Promise<void>>;
+  private senderKeyDistributionPreparedCache: SmartLRUCache<string, boolean>;
   private senderKeyEnvelopeMissingCache: SmartLRUCache<string, boolean>;
   private senderKeyEnvelopeForceLookupCache: SmartLRUCache<string, boolean>;
   private senderKeyRepairRequestCache: SmartLRUCache<string, boolean>;
@@ -74,6 +75,10 @@ export class GroupManager {
     this.senderKeyEnvelopeUploadCache = new SmartLRUCache({
       maxSize: config.maxDistributionCacheSize,
       ttlMs: config.senderKeyEnvelopeUploadCacheTTL,
+    });
+    this.senderKeyDistributionPreparedCache = new SmartLRUCache({
+      maxSize: config.maxDistributionCacheSize,
+      ttlMs: Math.max(Number(config.senderKeyEnvelopeUploadCacheTTL || 0), 5 * 60 * 1000),
     });
     this.senderKeyEnvelopeMissingCache = new SmartLRUCache({
       maxSize: 5000,
@@ -206,6 +211,25 @@ export class GroupManager {
     return (CryptoJS as any).MD5(unique.join('|')).toString();
   }
 
+  calculateMemberUidHashFromMembers(members: any): string {
+    if (!Array.isArray(members) || members.length === 0) {
+      return '';
+    }
+    const unique = Array.from(new Set(
+      members
+        .filter((member) => member && member.uid)
+        .map((member) => String(member.uid)),
+    )).sort();
+    if (unique.length === 0) {
+      return '';
+    }
+    return (CryptoJS as any).MD5(unique.join('|')).toString();
+  }
+
+  private normalizeRotationMemberHash(memberHash: any, members: any): string {
+    return this.calculateMemberUidHashFromMembers(members) || this.normalizeMemberHash(memberHash, members);
+  }
+
   private normalizeMemberDeviceIds(member: any): string[] {
     const rawDevices =
       member.devices ||
@@ -319,7 +343,7 @@ export class GroupManager {
     const prevLock = this.groupEncryptionLocks.get(lockKey) || Promise.resolve();
     const currentLock = prevLock.then(async () => {
       const loadStartedAt = this.now();
-      const normalizedMemberHash = this.normalizeMemberHash(memberHash, members);
+      const normalizedMemberHash = this.normalizeRotationMemberHash(memberHash, members);
       let record: any = await this.loadSenderKeyRecord(groupId, this.uid, this.deviceId);
       const loadMs = this.now() - loadStartedAt;
       const shouldCreateSenderKey = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
@@ -351,6 +375,7 @@ export class GroupManager {
       if (distribution) {
         const uploadStartedAt = this.now();
         await this.uploadDistributionEnvelopes(groupId, distribution);
+        this.markSenderKeyDistributionPrepared(groupId, record, members, normalizedMemberHash);
         uploadMs = this.now() - uploadStartedAt;
         if (shouldReuploadForIdentityRepair) {
           this.markIdentityRepairDistributionDone(groupId);
@@ -380,7 +405,7 @@ export class GroupManager {
     const prevLock = this.groupEncryptionLocks.get(groupId) || Promise.resolve();
     const currentLock = prevLock.then(async () => {
       const loadStartedAt = this.now();
-      const normalizedMemberHash = this.normalizeMemberHash(memberHash, members);
+      const normalizedMemberHash = this.normalizeRotationMemberHash(memberHash, members);
       let record: any = await this.loadSenderKeyRecord(groupId, this.uid, this.deviceId);
       const loadMs = this.now() - loadStartedAt;
       const shouldCreateSenderKey = !record || (normalizedMemberHash && record.memberHash !== normalizedMemberHash);
@@ -399,7 +424,10 @@ export class GroupManager {
       const encryptResult = await cipher.encrypt(plaintext);
       const encryptMs = this.now() - encryptStartedAt;
       const payload: any = { ...encryptResult.payload, sender_device_id: this.deviceId };
-      const shouldDistribute = shouldCreateSenderKey || shouldReuploadForIdentityRepair || this.shouldRetrySenderKeyDistribution(record, payload);
+      const shouldRetryDistribution =
+        this.shouldRetrySenderKeyDistribution(record, payload) &&
+        !this.isSenderKeyDistributionPrepared(groupId, record, members, normalizedMemberHash);
+      const shouldDistribute = shouldCreateSenderKey || shouldReuploadForIdentityRepair || shouldRetryDistribution;
       let buildMs = 0;
       let uploadMs = 0;
       let envelopeCount = 0;
@@ -413,6 +441,7 @@ export class GroupManager {
           envelopeCount = distribution?.distribution?.ciphertexts?.length || 0;
           const uploadStartedAt = this.now();
           await this.uploadDistributionEnvelopes(groupId, distribution);
+          this.markSenderKeyDistributionPrepared(groupId, record, members, normalizedMemberHash);
           uploadMs = this.now() - uploadStartedAt;
           if (shouldReuploadForIdentityRepair) {
             this.markIdentityRepairDistributionDone(groupId);
@@ -655,6 +684,47 @@ export class GroupManager {
       });
     }
     return this.senderKeyEnvelopeUploadCache;
+  }
+
+  private getSenderKeyDistributionPreparedCache(): SmartLRUCache<string, boolean> {
+    if (!this.senderKeyDistributionPreparedCache) {
+      const config = E2EEConfigManager.getInstance().getConfig();
+      this.senderKeyDistributionPreparedCache = new SmartLRUCache({
+        maxSize: config.maxDistributionCacheSize,
+        ttlMs: Math.max(Number(config.senderKeyEnvelopeUploadCacheTTL || 0), 5 * 60 * 1000),
+      });
+    }
+    return this.senderKeyDistributionPreparedCache;
+  }
+
+  markSenderKeyDistributionPrepared(groupId: any, record: any, members: any[], memberHash: string): void {
+    const key = this.getSenderKeyDistributionPreparedKey(groupId, record, members, memberHash);
+    if (key) {
+      this.getSenderKeyDistributionPreparedCache().set(key, true);
+    }
+    const senderKey = this.getSenderKeyDistributionPreparedKey(groupId, record, [], '');
+    if (senderKey) {
+      this.getSenderKeyDistributionPreparedCache().set(senderKey, true);
+    }
+  }
+
+  private isSenderKeyDistributionPrepared(groupId: any, record: any, members: any[], memberHash: string): boolean {
+    const key = this.getSenderKeyDistributionPreparedKey(groupId, record, members, memberHash);
+    if (key && this.getSenderKeyDistributionPreparedCache().get(key)) {
+      return true;
+    }
+    const senderKey = this.getSenderKeyDistributionPreparedKey(groupId, record, [], '');
+    return !!(senderKey && this.getSenderKeyDistributionPreparedCache().get(senderKey));
+  }
+
+  private getSenderKeyDistributionPreparedKey(groupId: any, record: any, members: any[], memberHash: string): string {
+    const state: any = record && typeof record.getState === 'function' ? record.getState() : null;
+    const keyId = state && state.keyId;
+    if (!groupId || keyId === undefined || keyId === null || keyId === '') {
+      return '';
+    }
+    const deviceSetHash = this.calculateMemberHashFromMembers(members) || this.normalizeMemberHash(memberHash, members);
+    return `${groupId}:${this.uid}:${this.deviceId}:${keyId}:${deviceSetHash || ''}`;
   }
 
   private getSenderKeyEnvelopeUploadCacheKey(groupId: any, distribution: any, envelopes: any[]): string {

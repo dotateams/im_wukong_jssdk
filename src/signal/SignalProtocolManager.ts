@@ -8,6 +8,7 @@ import { PreKeyManager } from './managers/PreKeyManager'
 import { SessionManager } from './managers/SessionManager'
 import { GroupManager } from './managers/GroupManager'
 import { KeyBundleDirectory } from './managers/KeyBundleDirectory'
+import { E2EEConfigManager } from './E2EEConfig'
 import { randomBytes, stringToArrayBuffer, arrayBufferToString } from './utils/bytes'
 import { toBase64, fromBase64 } from './utils/base64'
 import { hkdfSha256Bytes, hkdfExpandWord, arrayBufferToWordArray, wordArrayToUint8Array } from './utils/hkdf'
@@ -672,15 +673,18 @@ export class SignalProtocolManager {
       const plainBuffer = await subtle.decrypt({ name: "AES-GCM", iv: ivBytes }, key, combined)
       return this.arrayBufferToString(plainBuffer)
     } catch (e) {
-      console.error("[SignalProtocolManager] decryptGroupDistributionForDevice decrypt failed", {
-        uid: ciphertext.uid,
-        device_id: ciphertext.device_id,
-        enc: ciphertext.enc,
-        kdf: ciphertext.kdf,
-        iv_len: ivBytes.length,
-        body_len: bodyBytes.length,
-        tag_len: tagBytes.length,
-      }, e)
+      const config = E2EEConfigManager.getInstance().getConfig()
+      if (config.debugEnabled || config.verboseLogging) {
+        console.warn("[SignalProtocolManager] stale group distribution envelope skipped", {
+          uid: ciphertext.uid,
+          device_id: ciphertext.device_id,
+          enc: ciphertext.enc,
+          kdf: ciphertext.kdf,
+          iv_len: ivBytes.length,
+          body_len: bodyBytes.length,
+          tag_len: tagBytes.length,
+        }, e)
+      }
       throw e
     }
   }
