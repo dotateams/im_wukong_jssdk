@@ -114,7 +114,15 @@ export class ChatManager {
 
             const message = new Message(recvPacket)
             this.debugRawReceivedMessage(message)
+            this.logRealtimeE2EEStep("收到实时消息", message)
+            if (this.deferRealtimeE2EEDecryptIfNeed(message)) {
+                this.sendRecvackPacket(recvPacket);
+                this.logRealtimeE2EEStep("实时消息已先回ACK并进入后台解密", message)
+                WKSDK.shared().channelManager.notifySubscribeIfNeed(message);
+                return;
+            }
             await this.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true })
+            this.logRealtimeE2EEStep("实时消息同步解密完成", message)
             this.sendRecvackPacket(recvPacket);
             if (message.contentType === MessageContentType.cmd) { // 命令类消息分流处理
                 if (this.handleE2EEControlCMD(message)) { // E2EE 控制类 CMD 由 SDK 内部消费
@@ -242,11 +250,14 @@ export class ChatManager {
         const cachedContent = this.restoreCachedE2EEPlaintext(message, signalContent)
         if (cachedContent) {
             try {
+                this.logRealtimeE2EEStep("E2EE解密尝试使用本地明文缓存", message, signalContent)
                 message.content = await WKSDK.shared().config.e2ee.restoreCachedPlaintext(cachedContent, message.channel)
                 ;(message as any).e2eeDecryptFailed = false
                 this.debugE2EEDecrypt("cache", message, message.content)
+                this.logRealtimeE2EEStep("E2EE本地明文缓存恢复成功", message, signalContent, { contentType: message.contentType })
                 return
             } catch (error) {
+                this.logRealtimeE2EEStep("E2EE本地明文缓存恢复失败，删除缓存后继续密文解密", message, signalContent, { error: this.e2eeErrorText(error) })
                 this.removeE2EEPlaintextCacheKeys(message, signalContent)
                 this.debugE2EEDecryptFailure(message, cachedContent, error)
                 console.error("[E2EE] cached plaintext restore failed", {
@@ -266,13 +277,21 @@ export class ChatManager {
             senderDeviceId: signalContent.senderDeviceId,
         }
         try {
+            const decryptStartedAt = Date.now()
+            this.logRealtimeE2EEStep("E2EE开始调用解密适配器", message, signalContent)
             message.content = await WKSDK.shared().config.e2ee.decryptMessage(message.content, message.channel, decryptContext)
+            this.logRealtimeE2EEStep("E2EE解密适配器返回成功", message, signalContent, { costMs: Date.now() - decryptStartedAt, contentType: message.contentType })
             this.cacheE2EEPlaintext(message, signalContent, message.content)
             this.debugE2EEDecrypt("after", message, message.content)
+            ;(message as any).e2eePendingDecrypt = false
+            ;(message as any).e2eeDecrypting = false
             ;(message as any).e2eeDecryptFailed = false
+            ;(message as any).e2eeDecryptError = undefined
             await this.retryPendingE2EEDecryptsAfterGroupDistribution(message, signalContent)
         } catch (error) {
+            this.logRealtimeE2EEStep("E2EE解密适配器返回失败", message, signalContent, { error: this.e2eeErrorText(error) })
             if (this.isRecoverableE2EEPath(options) && options.deferRecoverable && this.isRecoverableRealtimeE2EEError(error, message, signalContent, options)) {
+                this.logRealtimeE2EEStep("E2EE失败可恢复，保持解密中占位并进入异步修复队列", message, signalContent, { error: this.e2eeErrorText(error) })
                 this.buildE2EEDecryptSkeletonContent(message)
                 this.enqueueRealtimeE2EERetry(message, signalContent, decryptContext, error, options)
                 return
@@ -285,25 +304,32 @@ export class ChatManager {
                 options,
             )
             if (realtimeRetry.recovered) {
+                this.logRealtimeE2EEStep("E2EE实时重试恢复成功", message, signalContent)
                 return
             }
             if (realtimeRetry.error) {
                 error = realtimeRetry.error
             } else if (this.isRecoverableRealtimeE2EEError(error, message, signalContent, options)) {
+                this.logRealtimeE2EEStep("E2EE尝试同步恢复缺失密钥", message, signalContent, { error: this.e2eeErrorText(error) })
                 const recovered = await this.recoverRealtimeE2EEDecryptFailure(message, signalContent, decryptContext, error, options)
                 if (recovered) {
                     try {
+                        const retryStartedAt = Date.now()
+                        this.logRealtimeE2EEStep("E2EE密钥恢复成功，开始二次解密", message, signalContent)
                         message.content = await WKSDK.shared().config.e2ee.decryptMessage(signalContent, message.channel, decryptContext)
+                        this.logRealtimeE2EEStep("E2EE二次解密成功", message, signalContent, { costMs: Date.now() - retryStartedAt, contentType: message.contentType })
                         this.cacheE2EEPlaintext(message, signalContent, message.content)
                         this.debugE2EEDecrypt("after", message, message.content)
                         ;(message as any).e2eeDecryptFailed = false
                         ;(message as any).e2eeDecryptError = undefined
                         return
                     } catch (retryError) {
+                        this.logRealtimeE2EEStep("E2EE二次解密失败", message, signalContent, { error: this.e2eeErrorText(retryError) })
                         error = retryError
                     }
                 }
             }
+            this.logRealtimeE2EEStep("E2EE解密最终失败，显示用户友好失败文案", message, signalContent, { error: this.e2eeErrorText(error) })
             this.finalizeE2EEDecryptFailure(message, signalContent, error, options)
         }
     }
@@ -343,6 +369,89 @@ export class ChatManager {
             }
         })
         this.realtimeE2EERetryChains.set(key, chain)
+    }
+
+    deferRealtimeE2EEDecryptIfNeed(message: Message): boolean {
+        if (!this.isSignalMessageContent(message.content)) {
+            return false
+        }
+        const signalContent = message.content as MessageSignalContent
+        if (!this.isUserVisibleSignalContent(signalContent)) {
+            this.logRealtimeE2EEStep("实时E2EE消息是内部控制消息，不展示占位", message, signalContent)
+            return false
+        }
+        this.logRealtimeE2EEStep("实时E2EE消息先展示解密中占位", message, signalContent)
+        this.buildE2EEDecryptSkeletonContent(message)
+        this.notifyMessageListeners(message)
+        setTimeout(() => {
+            this.decryptRealtimeE2EEMessageInBackground(message, signalContent).catch((error) => {
+                this.logRealtimeE2EEStep("实时E2EE后台解密异常，显示失败占位", message, signalContent, { error: this.e2eeErrorText(error) })
+                this.finalizeE2EEDecryptFailure(message, signalContent, error, { realtime: true })
+                this.notifyMessageListeners(message)
+            })
+        }, 0)
+        return true
+    }
+
+    private isUserVisibleSignalContent(signalContent: MessageSignalContent): boolean {
+        if (signalContent.realContentType === MessageContentType.cmd) {
+            return false
+        }
+        return signalContent.messageType !== "signal_group_distribution"
+    }
+
+    private async decryptRealtimeE2EEMessageInBackground(message: Message, signalContent: MessageSignalContent): Promise<void> {
+        const startedAt = Date.now()
+        this.logRealtimeE2EEStep("实时E2EE后台解密开始", message, signalContent)
+        message.content = signalContent
+        await this.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true })
+        this.logRealtimeE2EEStep("实时E2EE后台解密结束", message, signalContent, { costMs: Date.now() - startedAt, contentType: message.contentType })
+        if (message.contentType === MessageContentType.cmd) {
+            if (this.handleE2EEControlCMD(message)) {
+                this.logRealtimeE2EEStep("实时E2EE后台解密结果为内部控制消息，已内部消费", message, signalContent, { costMs: Date.now() - startedAt })
+                return
+            }
+            this.logRealtimeE2EEStep("实时E2EE后台解密结果为CMD，通知CMD监听", message, signalContent, { costMs: Date.now() - startedAt })
+            this.notifyCMDListeners(message)
+            return
+        }
+        this.logRealtimeE2EEStep("实时E2EE后台解密成功，通知UI原地替换", message, signalContent, { costMs: Date.now() - startedAt })
+        this.notifyMessageListeners(message)
+        WKSDK.shared().channelManager.notifySubscribeIfNeed(message)
+    }
+
+    private logRealtimeE2EEStep(step: string, message: Message, signalContent?: MessageSignalContent, extra?: any): void {
+        try {
+            const content = signalContent || (this.isSignalMessageContent(message.content) ? message.content as MessageSignalContent : undefined)
+            const payload = {
+                step,
+                channelID: message.channel && message.channel.channelID,
+                channelType: message.channel && message.channel.channelType,
+                fromUID: message.fromUID,
+                senderDeviceId: content && content.senderDeviceId,
+                messageID: message.messageID,
+                clientMsgNo: message.clientMsgNo,
+                messageSeq: message.messageSeq,
+                messageType: content && content.messageType,
+                realContentType: content && content.realContentType,
+                pending: (message as any).e2eePendingDecrypt === true,
+                failed: (message as any).e2eeDecryptFailed === true,
+                ...(extra || {}),
+            }
+            console.info("[E2EE调试]", payload)
+        } catch (_error) {
+            // ignore log failures
+        }
+    }
+
+    private e2eeErrorText(error: any): string {
+        if (!error) {
+            return ""
+        }
+        if (error.message) {
+            return String(error.message)
+        }
+        return String(error)
     }
 
     async retryPendingE2EEDecrypts(groupKey?: string): Promise<number> {

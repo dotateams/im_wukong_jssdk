@@ -1414,6 +1414,59 @@ test("e2ee_chat_manager decrypts signal content before listeners", async () => {
     assert.equal((message.content as MessageText).text, "decrypted");
 });
 
+test("e2ee_chat_manager defers realtime group decrypt so UI gets a pending message first", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const message = new Message();
+    message.channel = channel;
+    message.fromUID = "peer";
+    message.clientMsgNo = "client-1";
+    message.messageID = "message-1";
+    message.content = signalContent("signal_group");
+
+    let releaseDecrypt: (() => void) | undefined;
+    const decryptStarted = new Promise<void>((resolve) => {
+        releaseDecrypt = resolve;
+    });
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                await decryptStarted;
+                return new MessageText("decrypted realtime");
+            },
+        },
+    });
+
+    const notifiedMessages: Message[] = [];
+    const originalNotify = sdk.chatManager.notifyMessageListeners;
+
+    try {
+        (sdk.chatManager as any).notifyMessageListeners = (item: Message) => {
+            notifiedMessages.push(item);
+        };
+
+        const deferred = (sdk.chatManager as any).deferRealtimeE2EEDecryptIfNeed(message);
+
+        assert.equal(deferred, true);
+        assert.equal(notifiedMessages.length, 1);
+        assert.equal((notifiedMessages[0].content as MessageText).text, "消息解密中...");
+        assert.equal((notifiedMessages[0] as any).e2eePendingDecrypt, true);
+
+        releaseDecrypt!();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        assert.equal(notifiedMessages.length, 2);
+        assert.ok(notifiedMessages[1].content instanceof MessageText);
+        assert.equal((notifiedMessages[1].content as MessageText).text, "decrypted realtime");
+        assert.equal((notifiedMessages[1] as any).e2eePendingDecrypt, false);
+        assert.equal((notifiedMessages[1] as any).e2eeDecryptFailed, false);
+    } finally {
+        (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+});
+
 test("e2ee_chat_manager restores repeated history ciphertext from plaintext cache", async () => {
     const sessionCache = installStorageMock("sessionStorage");
     const sdk = resetSdk();
