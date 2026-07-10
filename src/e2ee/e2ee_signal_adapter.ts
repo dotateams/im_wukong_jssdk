@@ -131,8 +131,9 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
             return content;
         }
         const signalContent = content as MessageSignalContent;
-        const senderUid = this.resolveSenderUid(channel, context);
-        const senderDeviceId = context?.senderDeviceId || signalContent.senderDeviceId;
+        const senderInfo = this.resolveSignalSender(signalContent, channel, context);
+        const senderUid = senderInfo.senderUid;
+        const senderDeviceId = senderInfo.senderDeviceId;
         if (!senderUid) {
             throw new Error("Missing E2EE sender uid");
         }
@@ -163,11 +164,6 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         if (signalContent.messageType !== "signal_group") {
             return false;
         }
-        const senderUid = this.resolveSenderUid(channel, context);
-        const senderDeviceId = context?.senderDeviceId || signalContent.senderDeviceId;
-        if (!senderUid || !senderDeviceId) {
-            return false;
-        }
         let obj: any = signalContent.ciphertext;
         if (typeof obj === "string") {
             try {
@@ -179,7 +175,47 @@ export class SignalE2EEAdapter implements E2EECryptoAdapter {
         if (!obj || obj.type !== "signal_group") {
             return false;
         }
+        const senderUid = obj.sender_uid || this.resolveSenderUid(channel, context);
+        const senderDeviceId = obj.sender_device_id !== undefined && obj.sender_device_id !== null
+            ? obj.sender_device_id
+            : (context?.senderDeviceId || signalContent.senderDeviceId);
+        if (!senderUid || !senderDeviceId) {
+            return false;
+        }
         return this.signalManager.recoverGroupMessageDecryptFailure(obj, senderUid, senderDeviceId);
+    }
+
+    private resolveSignalSender(
+        signalContent: MessageSignalContent,
+        channel: Channel,
+        context?: E2EEDecryptContext | E2EERecoverContext,
+    ): { senderUid?: string; senderDeviceId?: string | number } {
+        if (channel.channelType === ChannelTypeGroup && signalContent.messageType === "signal_group") {
+            const obj = this.parseSignalCiphertextObject(signalContent);
+            if (obj && obj.type === "signal_group") {
+                const senderUid = obj.sender_uid || this.resolveSenderUid(channel, context);
+                const senderDeviceId = obj.sender_device_id !== undefined && obj.sender_device_id !== null
+                    ? obj.sender_device_id
+                    : (context?.senderDeviceId || signalContent.senderDeviceId);
+                return { senderUid, senderDeviceId };
+            }
+        }
+        return {
+            senderUid: this.resolveSenderUid(channel, context),
+            senderDeviceId: context?.senderDeviceId || signalContent.senderDeviceId,
+        };
+    }
+
+    private parseSignalCiphertextObject(signalContent: MessageSignalContent): any {
+        const ciphertext = signalContent && signalContent.ciphertext;
+        if (!ciphertext || typeof ciphertext !== "string") {
+            return ciphertext;
+        }
+        try {
+            return JSON.parse(ciphertext);
+        } catch (_error) {
+            return undefined;
+        }
     }
 
     private isSignalContent(content: MessageContent | any): boolean {

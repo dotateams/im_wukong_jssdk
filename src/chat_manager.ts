@@ -1,7 +1,7 @@
 import { MessageContentType } from "./const";
 import { Guid } from "./guid";
 import WKSDK from "./index";
-import { Channel, ChannelTypePerson, MediaMessageContent, Message, MessageContent, SyncOptions, MessageSignalContent, MessageText, CMDContent } from "./model";
+import { Channel, ChannelTypeGroup, ChannelTypePerson, MediaMessageContent, Message, MessageContent, SyncOptions, MessageSignalContent, MessageText, CMDContent } from "./model";
 import { Packet, RecvackPacket, RecvPacket, SendackPacket, SendPacket, Setting } from "./proto";
 import { Task, MessageTask, TaskStatus } from "./task";
 import { Md5 } from "md5-typescript";
@@ -61,6 +61,8 @@ export class ChatManager {
     private pendingRealtimeE2EEMaxTTL: number = 5 * 60 * 1000
     private pendingRealtimeE2EEMaxTotal: number = 2000
     private pendingRealtimeE2EEMaxPerGroup: number = 200
+    private e2eePostSendRepairTimers: Map<string, any> = new Map()
+    private e2eePostSendRepairDelayMs: number = 2500
     private readonly e2eeDecryptingText: string = "消息解密中..."
     private readonly e2eeDecryptFailedText: string = "消息无法解密"
     // 终态失败群消息登记表，等待 sender key 到达后原地重解密（无需刷新页面）。
@@ -135,6 +137,8 @@ export class ChatManager {
             WKSDK.shared().channelManager.notifySubscribeIfNeed(message); // 通知指定的订阅者
         } else if (packet instanceof SendackPacket) {
             const sendack = packet as SendackPacket;
+            const sendPacket = this.sendingQueues.get(sendack.clientSeq);
+            this.scheduleE2EEPostSendRepairDrain(sendPacket);
             this.sendingQueues.delete(sendack.clientSeq);
             // 发送消息回执
             this.notifyMessageStatusListeners(sendack);
@@ -404,8 +408,25 @@ export class ChatManager {
         const startedAt = Date.now()
         this.logRealtimeE2EEStep("实时E2EE后台解密开始", message, signalContent)
         message.content = signalContent
+        if (this.hasEarlierPendingRealtimeE2EEDecrypt(message, signalContent)) {
+            const waitError = new Error("Waiting for earlier group sender key message")
+            this.logRealtimeE2EEStep("Realtime E2EE waits for earlier pending group message", message, signalContent, { error: this.e2eeErrorText(waitError) })
+            this.buildE2EEDecryptSkeletonContent(message)
+            this.addPendingRealtimeE2EEDecrypt(
+                message,
+                signalContent,
+                { message, fromUID: message.fromUID, senderDeviceId: signalContent.senderDeviceId || "" },
+                waitError,
+                { realtime: true },
+            )
+            return
+        }
         await this.decryptMessageIfNeeded(message, { realtime: true, deferRecoverable: true })
         this.logRealtimeE2EEStep("实时E2EE后台解密结束", message, signalContent, { costMs: Date.now() - startedAt, contentType: message.contentType })
+        if ((message as any).e2eePendingDecrypt === true) {
+            this.logRealtimeE2EEStep("Realtime E2EE entered async repair queue, skip success notify", message, signalContent, { costMs: Date.now() - startedAt })
+            return
+        }
         if (message.contentType === MessageContentType.cmd) {
             if (this.handleE2EEControlCMD(message)) {
                 this.logRealtimeE2EEStep("实时E2EE后台解密结果为内部控制消息，已内部消费", message, signalContent, { costMs: Date.now() - startedAt })
@@ -454,11 +475,50 @@ export class ChatManager {
         return String(error)
     }
 
+    private hasEarlierPendingRealtimeE2EEDecrypt(message: Message, signalContent: MessageSignalContent): boolean {
+        if (!this.isGroupSignalMessage(message, signalContent)) {
+            return false
+        }
+        const groupKey = this.realtimeRetryKey(message, signalContent)
+        const currentKey = this.e2eeDecryptFailureCacheKey(message, signalContent)
+        const currentSeq = this.normalizedMessageSeq(message)
+        const now = Date.now()
+        for (const entry of Array.from(this.pendingRealtimeE2EEDecrypts.values())) {
+            if (entry.groupKey !== groupKey || entry.key === currentKey) {
+                continue
+            }
+            const pendingSeq = this.normalizedMessageSeq(entry.message)
+            if (pendingSeq !== undefined && currentSeq !== undefined) {
+                if (pendingSeq < currentSeq) {
+                    return true
+                }
+                continue
+            }
+            if (entry.createdAt <= now) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private comparePendingRealtimeE2EEDecrypt(a: PendingRealtimeE2EEDecrypt, b: PendingRealtimeE2EEDecrypt): number {
+        const seqA = this.normalizedMessageSeq(a.message)
+        const seqB = this.normalizedMessageSeq(b.message)
+        if (seqA !== undefined && seqB !== undefined && seqA !== seqB) {
+            return seqA - seqB
+        }
+        return a.createdAt - b.createdAt
+    }
+
     async retryPendingE2EEDecrypts(groupKey?: string): Promise<number> {
         const entries = Array.from(this.pendingRealtimeE2EEDecrypts.values())
             .filter((entry) => !groupKey || entry.groupKey === groupKey)
+            .sort((a, b) => this.comparePendingRealtimeE2EEDecrypt(a, b))
         let recovered = 0
         for (const entry of entries) {
+            if (!this.pendingRealtimeE2EEDecrypts.has(entry.key)) {
+                continue
+            }
             if (await this.retryOnePendingE2EEDecrypt(entry)) {
                 recovered++
             }
@@ -543,7 +603,7 @@ export class ChatManager {
             if (!current) {
                 return
             }
-            const recovered = await this.retryOnePendingE2EEDecrypt(current)
+            const recovered = await this.retryOnePendingE2EEDecrypt(current, true)
             if (!recovered && this.pendingRealtimeE2EEDecrypts.has(entry.key)) {
                 this.schedulePendingRealtimeE2EERetry(current)
             }
@@ -551,7 +611,7 @@ export class ChatManager {
         this.pendingRealtimeE2EETimers.set(entry.key, timer)
     }
 
-    private async retryOnePendingE2EEDecrypt(entry: PendingRealtimeE2EEDecrypt): Promise<boolean> {
+    private async retryOnePendingE2EEDecrypt(entry: PendingRealtimeE2EEDecrypt, drainGroupAfterSuccess: boolean = false): Promise<boolean> {
         if (Date.now() - entry.createdAt > this.pendingRealtimeE2EEMaxTTL) {
             this.finalizePendingRealtimeE2EEDecrypt(entry)
             return false
@@ -561,6 +621,9 @@ export class ChatManager {
             await this.attemptInPlaceRedecrypt(entry.message, entry.signalContent, entry.context, entry.error, entry.options)
             this.clearPendingRealtimeE2EEDecrypt(entry.key)
             this.notifyMessageListeners(entry.message)
+            if (drainGroupAfterSuccess) {
+                await this.retryPendingE2EEDecrypts(entry.groupKey)
+            }
             return true
         } catch (error) {
             entry.error = error
@@ -572,9 +635,15 @@ export class ChatManager {
     }
 
     private finalizePendingRealtimeE2EEDecrypt(entry: PendingRealtimeE2EEDecrypt): void {
+        const groupKey = entry.groupKey
         this.clearPendingRealtimeE2EEDecrypt(entry.key)
         this.finalizeE2EEDecryptFailure(entry.message, entry.signalContent, entry.error, entry.options)
         this.notifyMessageListeners(entry.message)
+        this.retryPendingE2EEDecrypts(groupKey).catch((error) => {
+            if (WKSDK.shared().config.debug) {
+                console.warn("[E2EE] retry pending decrypt after finalized failed", { groupKey }, error)
+            }
+        })
     }
 
     // attemptInPlaceRedecrypt 先尝试恢复缺失的群 sender key，再原地重解密该消息并更新其状态；
@@ -690,6 +759,40 @@ export class ChatManager {
         if (e2ee && typeof e2ee.redistributeGroup === "function") {
             await e2ee.redistributeGroup(new Channel(String(groupId), Number(channelType)))
         }
+    }
+
+    private scheduleE2EEPostSendRepairDrain(sendPacket?: SendPacket): void {
+        if (!sendPacket || sendPacket.channelType !== ChannelTypeGroup || !sendPacket.channelID) {
+            return
+        }
+        const e2ee = WKSDK.shared().config.e2ee as any
+        if (!e2ee || typeof e2ee.prepareGroupSend !== "function") {
+            return
+        }
+        const key = `${sendPacket.channelID}:${sendPacket.channelType}`
+        if (this.e2eePostSendRepairTimers.has(key)) {
+            return
+        }
+        const timer = setTimeout(() => {
+            this.e2eePostSendRepairTimers.delete(key)
+            const channel = new Channel(sendPacket.channelID, sendPacket.channelType)
+            Promise.resolve()
+                .then(() => {
+                    if (typeof e2ee.invalidateGroupRepairRequestCache === "function") {
+                        e2ee.invalidateGroupRepairRequestCache(channel)
+                    }
+                    return e2ee.prepareGroupSend(channel)
+                })
+                .catch((error) => {
+                    if (WKSDK.shared().config.debug) {
+                        console.warn("[E2EE] post-send repair drain failed", {
+                            channelID: sendPacket.channelID,
+                            channelType: sendPacket.channelType,
+                        }, error)
+                    }
+                })
+        }, this.e2eePostSendRepairDelayMs)
+        this.e2eePostSendRepairTimers.set(key, timer)
     }
 
     private realtimeRetryKey(message: Message, signalContent: MessageSignalContent): string {
@@ -1000,6 +1103,7 @@ export class ChatManager {
             || errorMessage.indexOf("E2EE decrypt adapter is unavailable") >= 0
             || errorMessage.indexOf("MessageCounterError") >= 0
             || errorMessage.indexOf("Message key not found") >= 0
+            || errorMessage.indexOf("Waiting for earlier group sender key message") >= 0
             || errorMessage.indexOf("DB not initialized") >= 0
             || errorMessage.indexOf("SQLiteService not initialized") >= 0
             || errorMessage.indexOf("IndexedDB") >= 0

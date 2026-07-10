@@ -1,6 +1,7 @@
 import * as assert from "assert";
 import WKSDK from "../../src";
 import { SendOptions } from "../../src/chat_manager";
+import { SendackPacket } from "../../src/proto";
 import {
     Channel,
     ChannelInfo,
@@ -1354,7 +1355,7 @@ test("e2ee_chat_manager sends encrypted packet while keeping local sent message 
     });
 
     const sentPackets: any[] = [];
-    const notifiedMessages: Message[] = [];
+    const notifiedTexts: string[] = [];
     const originalSend = sdk.chatManager.sendSendPacket;
     const originalNotify = sdk.chatManager.notifyMessageListeners;
 
@@ -1464,6 +1465,116 @@ test("e2ee_chat_manager defers realtime group decrypt so UI gets a pending messa
         assert.equal((notifiedMessages[1] as any).e2eeDecryptFailed, false);
     } finally {
         (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+});
+
+test("e2ee_chat_manager keeps realtime group decrypt order while sender key is pending", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const makeMessage = (id: string, seq: number, payload: string) => {
+        const message = new Message();
+        message.channel = channel;
+        message.fromUID = "peer";
+        message.clientMsgNo = `client-${id}`;
+        message.messageID = `message-${id}`;
+        message.messageSeq = seq;
+        const content = signalContent("signal_group");
+        content.ciphertext = JSON.stringify({ type: "signal_group", payload });
+        message.content = content;
+        return message;
+    };
+    const first = makeMessage("1", 10, "first plaintext");
+    const second = makeMessage("2", 11, "second plaintext");
+    let allowDecrypt = false;
+    const decryptPayloads: string[] = [];
+
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async (content: any) => {
+                const payload = JSON.parse(content.ciphertext).payload;
+                decryptPayloads.push(payload);
+                if (!allowDecrypt) {
+                    throw new Error("Missing sender key");
+                }
+                return new MessageText(payload);
+            },
+            recoverDecryptFailure: async () => false,
+        },
+    });
+    (sdk.chatManager as any).realtimeE2EEMaxAttempts = 1;
+    (sdk.chatManager as any).pendingRealtimeE2EERetryDelays = [60000];
+
+    const notifiedTexts: string[] = [];
+    const originalNotify = sdk.chatManager.notifyMessageListeners;
+
+    try {
+        (sdk.chatManager as any).notifyMessageListeners = (item: Message) => {
+            if (item.content instanceof MessageText) {
+                notifiedTexts.push((item.content as MessageText).text);
+            }
+        };
+
+        assert.equal((sdk.chatManager as any).deferRealtimeE2EEDecryptIfNeed(first), true);
+        await waitFor(() => {
+            assert.equal((sdk.chatManager as any).pendingRealtimeE2EEDecrypts.size, 1);
+        });
+
+        assert.equal((sdk.chatManager as any).deferRealtimeE2EEDecryptIfNeed(second), true);
+        await waitFor(() => {
+            assert.equal((sdk.chatManager as any).pendingRealtimeE2EEDecrypts.size, 2);
+        });
+
+        assert.equal(decryptPayloads.includes("second plaintext"), false);
+
+        allowDecrypt = true;
+        const recovered = await (sdk.chatManager as any).retryPendingE2EEDecrypts();
+
+        assert.equal(recovered, 2);
+        assert.equal((sdk.chatManager as any).pendingRealtimeE2EEDecrypts.size, 0);
+        assert.deepEqual(
+            notifiedTexts.filter((text) => text === "first plaintext" || text === "second plaintext"),
+            ["first plaintext", "second plaintext"],
+        );
+    } finally {
+        (sdk.chatManager as any).notifyMessageListeners = originalNotify;
+    }
+});
+
+test("e2ee_chat_manager drains pending sender-key repairs after group send ack", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("group-1", ChannelTypeGroup);
+    const e2ee = sdk.config.e2ee as any;
+    const originalPrepare = e2ee.prepareGroupSend;
+    const originalInvalidate = e2ee.invalidateGroupRepairRequestCache;
+    const calls: string[] = [];
+    const packet = sdk.chatManager.getSendPacketWithOptions(new MessageText("hello"), channel, new SendOptions());
+    const ack = new SendackPacket();
+    ack.clientSeq = packet.clientSeq;
+    ack.reasonCode = 1;
+    (sdk.chatManager as any).sendingQueues.set(packet.clientSeq, packet);
+    (sdk.chatManager as any).e2eePostSendRepairDelayMs = 10;
+
+    try {
+        e2ee.invalidateGroupRepairRequestCache = (item: Channel) => {
+            calls.push(`invalidate:${item.channelID}:${item.channelType}`);
+        };
+        e2ee.prepareGroupSend = async (item: Channel) => {
+            calls.push(`prepare:${item.channelID}:${item.channelType}`);
+        };
+
+        await sdk.chatManager.onPacket(ack);
+        await waitFor(() => {
+            assert.deepEqual(calls, [
+                "invalidate:group-1:2",
+                "prepare:group-1:2",
+            ]);
+        }, 500);
+    } finally {
+        e2ee.prepareGroupSend = originalPrepare;
+        e2ee.invalidateGroupRepairRequestCache = originalInvalidate;
+        (sdk.chatManager as any).e2eePostSendRepairDelayMs = 2500;
     }
 });
 

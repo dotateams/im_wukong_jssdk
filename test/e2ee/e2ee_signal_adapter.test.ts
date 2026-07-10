@@ -259,3 +259,47 @@ test("signal adapter decrypts person messages with sender uid from context", asy
     assert.ok(decrypted instanceof MessageText);
     assert.equal((decrypted as MessageText).text, "synced");
 });
+
+test("signal adapter recovers group sender key with sender uid from ciphertext before context", async () => {
+    resetSdk();
+    const signal = new MessageSignalContent();
+    signal.messageType = "signal_group";
+    signal.realContentType = MessageContentType.text;
+    signal.senderDeviceId = "bob-web";
+    signal.ciphertext = JSON.stringify({
+        type: "signal_group",
+        group_id: "group-1",
+        sender_uid: "bob",
+        sender_device_id: "bob-web",
+        key_id: 7,
+        body: "cipher",
+    });
+
+    const recoverCalls: Array<{ senderUid: string; senderDeviceId: any }> = [];
+    const adapter = new SignalE2EEAdapter({
+        localUid: "alice",
+        localDeviceId: "alice-web",
+        signalManager: {
+            deviceId: "alice-web",
+            getRemoteDevices: async () => [],
+            encryptMessage: async () => {
+                throw new Error("not used");
+            },
+            decryptMessage: async () => {
+                throw new Error("not used");
+            },
+            recoverGroupMessageDecryptFailure: async (_obj: any, senderUid: string, senderDeviceId: any) => {
+                recoverCalls.push({ senderUid, senderDeviceId });
+                return false;
+            },
+        },
+    });
+
+    await adapter.recoverDecryptFailure(
+        signal,
+        new Channel("group-1", ChannelTypeGroup),
+        { fromUID: "alice", senderDeviceId: "alice-web" },
+    );
+
+    assert.deepEqual(recoverCalls, [{ senderUid: "bob", senderDeviceId: "bob-web" }]);
+});
