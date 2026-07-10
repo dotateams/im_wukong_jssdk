@@ -384,11 +384,13 @@ test("group manager uploads sender key envelopes without attaching inline distri
     assert.equal(uploaded.sender_uid, "alice");
     assert.equal(uploaded.sender_device_id, "alice-web");
     assert.equal(uploaded.key_id, 9);
-    assert.deepEqual(uploaded.envelopes, [{
-        recipient_uid: "bob",
-        recipient_device_id: "bob-web",
-        envelope: JSON.stringify({ uid: "bob", device_id: "bob-web", body: "key" }),
-    }]);
+    assert.equal(uploaded.version, 2);
+    assert.equal(uploaded.envelopes, undefined);
+    assert.deepEqual(uploaded.items, [[
+        "bob",
+        "bob-web",
+        JSON.stringify({ uid: "bob", device_id: "bob-web", body: "key" }),
+    ]]);
 });
 
 test("group manager includes sender own devices in sender-key envelopes for history recovery", async () => {

@@ -416,5 +416,58 @@ test("explicit group distribution upload returns compact payload without inline 
 
   assert.equal(body.type, "signal_group_distribution");
   assert.equal(body.distribution, undefined);
-  assert.equal(uploaded.envelopes.length, 2);
+  assert.equal(uploaded.version, 2);
+  assert.equal(uploaded.envelopes, undefined);
+  assert.equal(uploaded.items.length, 2);
+  assert.deepEqual(uploaded.items.map((item: any[]) => item.slice(0, 2)), [
+    ["alice", "web"],
+    ["alice", "app"],
+  ]);
+  const firstEnvelope = JSON.parse(uploaded.items[0][2]);
+  assert.equal(firstEnvelope.uid, "alice");
+  assert.equal(firstEnvelope.device_id, "web");
+  assert.equal(firstEnvelope.enc, "aes-256-gcm");
+  assert.equal(firstEnvelope.is_ecies, true);
+});
+
+test("sender-key envelope upload uses compact batches", async () => {
+  const uploads: any[] = [];
+  const parent = {
+    uploadGroupSenderKeyEnvelopes: async (payload: any) => {
+      uploads.push(payload);
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  manager.senderKeyEnvelopeUploadBatchSize = 100;
+  const ciphertexts = Array.from({ length: 250 }, (_, index) => ({
+    uid: `user-${index}`,
+    device_id: `device-${index}`,
+    enc: "aes-256-gcm",
+    body: `ciphertext-${index}`,
+  }));
+
+  await manager.uploadDistributionEnvelopes("g1", {
+    key_id: 11,
+    member_hash: "members-v1",
+    distribution: { ciphertexts },
+  });
+
+  assert.equal(uploads.length, 3);
+  assert.deepEqual(uploads.map((item) => item.items.length), [100, 100, 50]);
+  assert.ok(uploads.every((item) => item.version === 2));
+  assert.ok(uploads.every((item) => item.envelopes === undefined));
+
+  const compactSize = JSON.stringify(uploads[0]).length;
+  const legacySize = JSON.stringify({
+    group_id: "g1",
+    sender_uid: "sender",
+    sender_device_id: "device",
+    key_id: 11,
+    envelopes: ciphertexts.slice(0, 100).map((item) => ({
+      recipient_uid: item.uid,
+      recipient_device_id: item.device_id,
+      envelope: JSON.stringify({ ...item, is_ecies: true }),
+    })),
+  }).length;
+  assert.ok(compactSize < legacySize * 0.75, `compact=${compactSize} legacy=${legacySize}`);
 });

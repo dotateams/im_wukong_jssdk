@@ -37,6 +37,7 @@ export class GroupManager {
   private readonly firstLoginEnvelopeGraceMs: number;
   private firstLoginGraceUntil: number;
   senderKeyEnvelopeConcurrency: number;
+  senderKeyEnvelopeUploadBatchSize: number;
   private identityRepairGeneration: number;
   private identityRepairDistributionGroups: Set<string>;
 
@@ -64,6 +65,7 @@ export class GroupManager {
     this.senderKeyEnvelopeForceLookupCooldownMs = Math.max(500, Math.min(Number(config.retryDelayMs || 1000), 3000));
     this.firstLoginEnvelopeGraceMs = Math.max(0, Number(config.firstLoginEnvelopeGraceMs || 30000));
     this.senderKeyEnvelopeConcurrency = Math.max(1, Number(config.senderKeyEnvelopeConcurrency || config.groupDistributionConcurrency || 10));
+    this.senderKeyEnvelopeUploadBatchSize = Math.max(1, Number((config as any).senderKeyEnvelopeUploadBatchSize || 100));
     this.senderKeyCache = new SmartLRUCache({
       maxSize: config.maxSenderKeyCacheSize,
       ttlMs: config.sessionCacheTTL,
@@ -520,13 +522,11 @@ export class GroupManager {
       return;
     }
     const doUpload = async () => {
-      await this.parent.uploadGroupSenderKeyEnvelopes({
-        group_id: groupId,
-        sender_uid: this.uid,
-        sender_device_id: this.deviceId,
-        key_id: distribution.key_id ?? distribution.keyId,
-        envelopes,
-      });
+      for (const batch of this.chunkSenderKeyEnvelopes(envelopes)) {
+        await this.parent.uploadGroupSenderKeyEnvelopes(
+          this.buildCompactSenderKeyEnvelopeUploadPayload(groupId, distribution, batch),
+        );
+      }
       if (uploadCacheKey) {
         uploadCache.set(uploadCacheKey, true);
       }
@@ -545,6 +545,30 @@ export class GroupManager {
         this.senderKeyEnvelopeUploadPromises.delete(uploadCacheKey);
       }
     }
+  }
+
+  private chunkSenderKeyEnvelopes(envelopes: any[]): any[][] {
+    const batchSize = Math.max(1, Number((this as any).senderKeyEnvelopeUploadBatchSize || 100));
+    const batches: any[][] = [];
+    for (let i = 0; i < envelopes.length; i += batchSize) {
+      batches.push(envelopes.slice(i, i + batchSize));
+    }
+    return batches;
+  }
+
+  private buildCompactSenderKeyEnvelopeUploadPayload(groupId: any, distribution: any, envelopes: any[]) {
+    return {
+      version: 2,
+      group_id: groupId,
+      sender_uid: this.uid,
+      sender_device_id: this.deviceId,
+      key_id: distribution.key_id ?? distribution.keyId,
+      items: envelopes.map((item) => [
+        item.recipient_uid,
+        item.recipient_device_id,
+        item.envelope,
+      ]),
+    };
   }
 
   async uploadPendingRepairEnvelopes(groupId: any, record: any, memberHash: string, options: { background?: boolean } = {}): Promise<number> {
