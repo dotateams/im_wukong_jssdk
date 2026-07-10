@@ -1477,11 +1477,55 @@ export class ChatManager {
     // 通知消息监听者
     notifyMessageListeners(message: Message) {
         if (this.listeners) {
-            this.listeners.forEach((listener: MessageListener) => {
+            const totalStartedAt = this.nowMs()
+            this.listeners.forEach((listener: MessageListener, index: number) => {
                 if (listener) {
+                    const startedAt = this.nowMs()
                     listener(message);
+                    const costMs = this.nowMs() - startedAt
+                    if (costMs >= 100) {
+                        this.warnMessageListenerSlow("消息监听器耗时过高", message, {
+                            listenerIndex: index,
+                            listenerName: (listener as any).name || "anonymous",
+                            costMs,
+                        })
+                    }
                 }
             });
+            const totalCostMs = this.nowMs() - totalStartedAt
+            if (totalCostMs >= 100) {
+                this.warnMessageListenerSlow("消息监听器总耗时过高", message, {
+                    listenerCount: this.listeners.length,
+                    costMs: totalCostMs,
+                })
+            }
+        }
+    }
+
+    private nowMs(): number {
+        if (typeof performance !== "undefined" && typeof performance.now === "function") {
+            return performance.now()
+        }
+        return Date.now()
+    }
+
+    private warnMessageListenerSlow(reason: string, message: Message, extra: any) {
+        try {
+            console.warn("[消息性能]", {
+                reason,
+                channelID: message.channel && message.channel.channelID,
+                channelType: message.channel && message.channel.channelType,
+                fromUID: message.fromUID,
+                messageID: message.messageID,
+                clientMsgNo: message.clientMsgNo,
+                messageSeq: message.messageSeq,
+                contentType: message.contentType,
+                pending: (message as any).e2eePendingDecrypt === true,
+                failed: (message as any).e2eeDecryptFailed === true,
+                ...(extra || {}),
+            })
+        } catch (_error) {
+            // ignore diagnostics failures
         }
     }
 
