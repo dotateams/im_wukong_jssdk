@@ -1523,6 +1523,63 @@ test("group manager suppresses repeated permanent missing sender key envelope lo
     }
 });
 
+test("group manager persists empty sender key envelope lookup cooldown across reloads", async () => {
+    const originalLocalStorage = (global as any).localStorage;
+    const values = new Map<string, string>();
+    (global as any).localStorage = {
+        getItem: (key: string) => values.get(key) || null,
+        setItem: (key: string, value: string) => values.set(key, value),
+        removeItem: (key: string) => values.delete(key),
+        key: (index: number) => Array.from(values.keys())[index] || null,
+        get length() {
+            return values.size;
+        },
+    };
+
+    let lookups = 0;
+    const createManager = () => {
+        const manager: any = Object.create(GroupManager.prototype);
+        manager.uid = "bob";
+        manager.deviceId = "bob-web";
+        manager.groupEnvelopeRecoveryPromises = new Map();
+        manager.senderKeyEnvelopeMissingCache = undefined;
+        manager.senderKeyEnvelopeForceLookupCache = undefined;
+        manager.senderKeyRepairRequestCache = undefined;
+        manager.senderKeyRepairBatchQueue = new Map();
+        manager.firstLoginGraceUntil = 0;
+        manager.parent = {
+            lookupGroupSenderKeyEnvelope: async () => {
+                lookups++;
+                return {};
+            },
+            requestGroupSenderKeyRepair: async () => undefined,
+        };
+        return manager;
+    };
+
+    try {
+        const firstManager = createManager();
+        const first = await firstManager.recoverSenderKeyFromEnvelope(
+            { group_id: "group-1", key_id: 9 },
+            "alice",
+            "alice-web",
+        );
+
+        const secondManagerAfterReload = createManager();
+        const second = await secondManagerAfterReload.recoverSenderKeyFromEnvelope(
+            { group_id: "group-1", key_id: 9 },
+            "alice",
+            "alice-web",
+        );
+
+        assert.equal(first, false);
+        assert.equal(second, false);
+        assert.equal(lookups, 1);
+    } finally {
+        (global as any).localStorage = originalLocalStorage;
+    }
+});
+
 test("group manager treats first-login 404 sender key envelope as retryable", async () => {
     const manager: any = Object.create(GroupManager.prototype);
     manager.uid = "bob";
