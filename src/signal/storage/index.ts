@@ -4,4 +4,5 @@ export {
   migrateSenderKeysFromLocalStorage,
   hasLocalStorageSenderKeys,
   clearLocalStorageSenderKeys,
+  parseSenderKeyStorageKey,
 } from './migrateSenderKeys'

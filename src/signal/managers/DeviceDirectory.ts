@@ -1,4 +1,4 @@
-import StorageService from '../storage/StorageService'
+import { E2EECacheStore, E2EE_CACHE_STORES } from '../../e2ee/e2ee_cache_store'
 
 type DeviceDirectoryOptions = {
   uid?: string
@@ -42,6 +42,10 @@ export class DeviceDirectory {
     // 0 means long-lived. It is invalidated by member changes or forceRefresh.
     this.channelDevicesCacheTtlMs = 0
     this.channelDevicesVersionCheckIntervalMs = 30 * 1000
+    const persistentPrefix = this.getPersistentChannelDevicesPrefix()
+    if (persistentPrefix) {
+      E2EECacheStore.shared().scheduleLegacyMigration(E2EE_CACHE_STORES.CHANNEL_DEVICES, persistentPrefix)
+    }
   }
 
   async getRemoteDevices(uid: string, forceRefresh?: boolean) {
@@ -102,12 +106,12 @@ export class DeviceDirectory {
     }
     const cacheKey = this.getChannelDevicesCacheKey(channelId, channelType)
     const inflight = this.channelDevicesInFlight.get(cacheKey)
-    if (inflight && (forceRefresh || !this.getChannelDevicesCacheEntry(cacheKey))) {
+    if (inflight && (forceRefresh || !await this.getChannelDevicesCacheEntry(cacheKey))) {
       return await inflight
     }
 
     if (!forceRefresh) {
-      const cached = this.getChannelDevicesCacheEntry(cacheKey)
+      const cached = await this.getChannelDevicesCacheEntry(cacheKey)
       if (cached && Array.isArray(cached.devices) && !this.isChannelDevicesCacheExpired(cached)) {
         if (options && options.awaitFreshness) {
           if (!this.shouldCheckChannelDevicesVersion(cacheKey)) {
@@ -158,7 +162,7 @@ export class DeviceDirectory {
       this.channelDevicesInFlight.delete(cacheKey)
       this.channelDevicesVersionCheckedAt.delete(cacheKey)
       this.channelDevicesRefreshGeneration.set(cacheKey, (this.channelDevicesRefreshGeneration.get(cacheKey) || 0) + 1)
-      this.removePersistentChannelDevices(cacheKey)
+      this.removePersistentChannelDevices(cacheKey).catch(() => undefined)
     })
   }
 
@@ -169,7 +173,7 @@ export class DeviceDirectory {
     this.channelDevicesInFlight.clear()
     this.channelDevicesRefreshGeneration.clear()
     this.channelDevicesVersionCheckedAt.clear()
-    this.clearPersistentChannelDevices()
+    this.clearPersistentChannelDevices().catch(() => undefined)
   }
 
   private scheduleChannelDevicesRefresh(channelId: string, channelType: any, cacheKey: string) {
@@ -181,14 +185,14 @@ export class DeviceDirectory {
     }
     const generation = this.channelDevicesRefreshGeneration.get(cacheKey) || 0
     const reqPromise = new Promise<any[]>((resolve) => {
-      setTimeout(() => {
+      setTimeout(async () => {
         this.validateChannelDevicesVersionAndRefresh(channelId, channelType, cacheKey, generation)
           .then(resolve)
-          .catch((error) => {
+          .catch(async (error) => {
             if (typeof console !== 'undefined' && console.warn) {
               console.warn('[E2EE] refresh channel device directory failed', { channelId, channelType }, error)
             }
-            const cached = this.getChannelDevicesCacheEntry(cacheKey)
+            const cached = await this.getChannelDevicesCacheEntry(cacheKey)
             resolve(cached && Array.isArray(cached.devices) ? cached.devices : [])
           })
       }, 0)
@@ -235,7 +239,7 @@ export class DeviceDirectory {
         devicesVersion: (data && (data.devices_version || data.devicesVersion)) || versionInfo?.devicesVersion,
       }
       this.channelDevicesCache.set(cacheKey, entry)
-      this.setPersistentChannelDevices(cacheKey, entry)
+      await this.setPersistentChannelDevices(cacheKey, entry)
       this.markChannelDevicesVersionChecked(cacheKey)
     }
     return normalized
@@ -243,7 +247,7 @@ export class DeviceDirectory {
 
   private async validateChannelDevicesVersionAndRefresh(channelId: string, channelType: any, cacheKey: string, generation: number, refreshWhenVersionMissing?: boolean) {
     this.markChannelDevicesVersionChecked(cacheKey)
-    const cached = this.getChannelDevicesCacheEntry(cacheKey)
+    const cached = await this.getChannelDevicesCacheEntry(cacheKey)
     if (!cached) {
       return await this.fetchAndStoreChannelDevices(channelId, channelType, cacheKey, generation)
     }
@@ -323,12 +327,12 @@ export class DeviceDirectory {
     return Date.now() - entry.fetchedAt >= this.channelDevicesCacheTtlMs
   }
 
-  private getChannelDevicesCacheEntry(cacheKey: string) {
+  private async getChannelDevicesCacheEntry(cacheKey: string) {
     const cached = this.channelDevicesCache.get(cacheKey)
     if (cached && Array.isArray(cached.devices)) {
       return cached
     }
-    const persistent = this.getPersistentChannelDevices(cacheKey)
+    const persistent = await this.getPersistentChannelDevices(cacheKey)
     if (persistent && Array.isArray(persistent.devices)) {
       this.channelDevicesCache.set(cacheKey, persistent)
       return persistent
@@ -364,12 +368,12 @@ export class DeviceDirectory {
     ].join('_')
   }
 
-  private getPersistentChannelDevices(cacheKey: string) {
+  private async getPersistentChannelDevices(cacheKey: string) {
     const key = this.getPersistentChannelDevicesKey(cacheKey)
     if (!key) {
       return null
     }
-    const raw = StorageService.shared.getItem(key)
+    const raw = await E2EECacheStore.shared().get(E2EE_CACHE_STORES.CHANNEL_DEVICES, key)
     if (!raw) {
       return null
     }
@@ -377,18 +381,18 @@ export class DeviceDirectory {
       const parsed = JSON.parse(raw)
       return parsed && Array.isArray(parsed.devices) ? parsed : null
     } catch (error) {
-      StorageService.shared.removeItem(key)
+      await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.CHANNEL_DEVICES, key)
       return null
     }
   }
 
-  private setPersistentChannelDevices(cacheKey: string, entry: any) {
+  private async setPersistentChannelDevices(cacheKey: string, entry: any): Promise<void> {
     const key = this.getPersistentChannelDevicesKey(cacheKey)
     if (!key) {
       return
     }
     try {
-      StorageService.shared.setItem(key, JSON.stringify(entry))
+      await E2EECacheStore.shared().set(E2EE_CACHE_STORES.CHANNEL_DEVICES, key, JSON.stringify(entry))
     } catch (error) {
       if (typeof console !== 'undefined' && console.warn) {
         console.warn('[E2EE] persist channel device directory failed', error)
@@ -396,25 +400,18 @@ export class DeviceDirectory {
     }
   }
 
-  private removePersistentChannelDevices(cacheKey: string) {
+  private async removePersistentChannelDevices(cacheKey: string): Promise<void> {
     const key = this.getPersistentChannelDevicesKey(cacheKey)
     if (key) {
-      StorageService.shared.removeItem(key)
+      await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.CHANNEL_DEVICES, key)
     }
   }
 
-  private clearPersistentChannelDevices() {
+  private async clearPersistentChannelDevices(): Promise<void> {
     const prefix = this.getPersistentChannelDevicesPrefix()
-    if (!prefix || typeof localStorage === 'undefined') {
+    if (!prefix) {
       return
     }
-    const keys: string[] = []
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i)
-      if (key && key.indexOf(prefix) === 0) {
-        keys.push(key)
-      }
-    }
-    keys.forEach((key) => StorageService.shared.removeItem(key))
+    await E2EECacheStore.shared().clearPrefix(E2EE_CACHE_STORES.CHANNEL_DEVICES, prefix)
   }
 }

@@ -37,6 +37,7 @@ export class SessionManager {
   arrayBufferToString: (b: any) => string;
   ensureWebCrypto: () => void;
   sessionBuildingLocks: Map<string, Promise<void>>;
+  private sessionDecryptLocks: Map<string, Promise<void>>;
   maybeCheckAndRefillPreKeys: () => void;
   useOnetimePreKeys: (bundle: any) => Promise<any>;
   getRemoteKeyBundle: (uid: string, deviceId: string | number) => Promise<any>;
@@ -57,6 +58,7 @@ export class SessionManager {
     this.arrayBufferToString = params.arrayBufferToString;
     this.ensureWebCrypto = params.ensureWebCrypto;
     this.sessionBuildingLocks = new Map();
+    this.sessionDecryptLocks = new Map();
     this.maybeCheckAndRefillPreKeys = params.maybeCheckAndRefillPreKeys;
     this.useOnetimePreKeys = params.useOnetimePreKeys;
     this.getRemoteKeyBundle =
@@ -186,6 +188,7 @@ export class SessionManager {
   clearSessionCache() {
     this.sessionCache.clear();
     this.sessionBuildingLocks.clear();
+    this.sessionDecryptLocks.clear();
   }
 
   isRecoverablePreKeySessionError(messageType: any, message: string) {
@@ -222,6 +225,28 @@ export class SessionManager {
   }
 
   async decryptSignalCipherMessage(
+    remoteUid: string,
+    remoteDeviceId: string | number,
+    messageType: any,
+    ciphertext: any,
+  ) {
+    const lockKey = `${remoteUid}:${remoteDeviceId}`;
+    const previous = this.sessionDecryptLocks.get(lockKey) || Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>(resolve => { release = resolve; });
+    this.sessionDecryptLocks.set(lockKey, current);
+    await previous.catch(() => undefined);
+    try {
+      return await this.decryptSignalCipherMessageCore(remoteUid, remoteDeviceId, messageType, ciphertext);
+    } finally {
+      release();
+      if (this.sessionDecryptLocks.get(lockKey) === current) {
+        this.sessionDecryptLocks.delete(lockKey);
+      }
+    }
+  }
+
+  private async decryptSignalCipherMessageCore(
     remoteUid: string,
     remoteDeviceId: string | number,
     messageType: any,

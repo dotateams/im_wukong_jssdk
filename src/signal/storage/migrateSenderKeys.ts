@@ -1,6 +1,28 @@
 import { SignalProtocolStore } from './SignalProtocolStore'
 import { SenderKeyRecord } from '../models/SenderKeyRecord'
 
+export function parseSenderKeyStorageKey(key: string): {
+  uid: string
+  groupId: string
+  senderUid: string
+  senderDeviceId: string
+} | undefined {
+  const prefix = 'signal_sender_key_'
+  if (!key || key.indexOf(prefix) !== 0) {
+    return undefined
+  }
+  const parts = key.slice(prefix.length).split('_')
+  if (parts.length < 3 || !parts[0] || !parts[1] || !parts[2]) {
+    return undefined
+  }
+  return {
+    uid: parts[0],
+    groupId: parts[1],
+    senderUid: parts[2],
+    senderDeviceId: parts.slice(3).join('_'),
+  }
+}
+
 /**
  * 迁移 localStorage 中的 sender keys 到 IndexedDB
  *
@@ -74,17 +96,17 @@ export async function migrateSenderKeysFromLocalStorage(
 
       // 解析 localStorage key 格式: signal_sender_key_{uid}_{groupId}_{senderUid}_{deviceId}
       // 或者: signal_sender_key_{uid}_{groupId}_{senderUid} (旧格式，没有 deviceId)
-      const parts = localStorageKey.split('_')
-      if (parts.length < 5) {
+      const parsedKey = parseSenderKeyStorageKey(localStorageKey)
+      if (!parsedKey) {
         stats.failed++
         stats.errors.push({ key: localStorageKey, error: 'Invalid key format' })
         continue
       }
 
-      const storedUid = parts[2]
-      const groupId = parts[3]
-      const senderUid = parts[4]
-      const senderDeviceId = parts[5] || ''
+      const storedUid = parsedKey.uid
+      const groupId = parsedKey.groupId
+      const senderUid = parsedKey.senderUid
+      const senderDeviceId = parsedKey.senderDeviceId
 
       // 验证 uid 是否匹配
       if (storedUid !== uid) {

@@ -1355,7 +1355,7 @@ test("e2ee_chat_manager sends encrypted packet while keeping local sent message 
     });
 
     const sentPackets: any[] = [];
-    const notifiedTexts: string[] = [];
+    const notifiedMessages: Message[] = [];
     const originalSend = sdk.chatManager.sendSendPacket;
     const originalNotify = sdk.chatManager.notifyMessageListeners;
 
@@ -1660,6 +1660,44 @@ test("e2ee_chat_manager restores repeated history ciphertext from plaintext cach
     assert.ok(replay.content instanceof MessageText);
     assert.equal((replay.content as MessageText).text, "cached plaintext");
     assert.equal((replay as any).e2eeDecryptFailed, false);
+});
+
+test("e2ee_chat_manager coalesces concurrent decrypts of the same private message", async () => {
+    const sdk = resetSdk();
+    const channel = new Channel("receiver", ChannelTypePerson);
+    let decryptCalls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    await sdk.config.initE2EE({
+        uid: "sender",
+        deviceId: "web-device-1",
+        cryptoAdapter: {
+            decryptMessage: async () => {
+                decryptCalls++;
+                await gate;
+                return new MessageText("one decrypt result");
+            },
+        },
+    });
+    const makeMessage = () => {
+        const message = new Message();
+        message.messageID = "same-message";
+        message.clientMsgNo = "same-client";
+        message.channel = channel;
+        message.fromUID = "receiver";
+        message.content = signalContent("signal_multi");
+        return message;
+    };
+    const first = makeMessage();
+    const duplicate = makeMessage();
+    const firstWork = sdk.chatManager.decryptMessageIfNeeded(first);
+    const duplicateWork = sdk.chatManager.decryptMessageIfNeeded(duplicate);
+    release();
+    await Promise.all([firstWork, duplicateWork]);
+
+    assert.equal(decryptCalls, 1);
+    assert.equal((first.content as MessageText).text, "one decrypt result");
+    assert.equal((duplicate.content as MessageText).text, "one decrypt result");
 });
 
 test("e2ee_chat_manager plaintext cache preserves reply metadata", async () => {

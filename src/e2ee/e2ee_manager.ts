@@ -5,6 +5,7 @@ import { SignalE2EEAdapter } from "./e2ee_signal_adapter";
 import { SignalProtocolManager } from "../signal/SignalProtocolManager";
 import { E2EEMediaCrypto, SaveOriginalOptions } from "./e2ee_media";
 import { E2EEConfigManager } from "../signal/E2EEConfig";
+import { E2EECacheStore, E2EE_CACHE_STORES } from "./e2ee_cache_store";
 
 export class E2EEManager {
     private options?: E2EEInitOptions;
@@ -43,6 +44,10 @@ export class E2EEManager {
                 throw new Error("E2EE deviceId is required");
             }
             this.options = await this.normalizeOptions(options);
+            E2EECacheStore.shared().scheduleLegacyMigration(
+                E2EE_CACHE_STORES.PLAINTEXT,
+                `wk_e2ee_plaintext:${this.options.uid}:${this.options.deviceId}:`,
+            );
             this.mediaCrypto = new E2EEMediaCrypto({
                 apiClient: this.options.apiClient,
                 provider: this.options.mediaProvider,
@@ -79,9 +84,9 @@ export class E2EEManager {
         if (!options) {
             return;
         }
-        this.clearPlaintextStorage(options.uid, options.deviceId);
+        await this.clearPlaintextStorage(options.uid, options.deviceId);
         if (this.mediaCrypto && typeof (this.mediaCrypto as any).clearLocalData === "function") {
-            ;(this.mediaCrypto as any).clearLocalData();
+            await (this.mediaCrypto as any).clearLocalData();
         }
     }
 
@@ -317,32 +322,9 @@ export class E2EEManager {
         return this.mediaCrypto.canForwardE2EEMedia(content as any);
     }
 
-    private clearPlaintextStorage(uid: string, deviceId: string): void {
+    private async clearPlaintextStorage(uid: string, deviceId: string): Promise<void> {
         const prefix = `wk_e2ee_plaintext:${uid}:${deviceId}:`;
-        for (const storage of [this.getStorage("sessionStorage"), this.getStorage("localStorage")]) {
-            if (!storage) {
-                continue;
-            }
-            const keys: string[] = [];
-            for (let i = 0; i < storage.length; i++) {
-                const key = storage.key(i);
-                if (key && key.indexOf(prefix) === 0) {
-                    keys.push(key);
-                }
-            }
-            for (const key of keys) {
-                storage.removeItem(key);
-            }
-        }
-    }
-
-    private getStorage(name: "sessionStorage" | "localStorage"): Storage | undefined {
-        try {
-            const storage = (globalThis as any)[name];
-            return storage || undefined;
-        } catch (_error) {
-            return undefined;
-        }
+        await E2EECacheStore.shared().clearPrefix(E2EE_CACHE_STORES.PLAINTEXT, prefix);
     }
 
     private async resolveChannelInfo(

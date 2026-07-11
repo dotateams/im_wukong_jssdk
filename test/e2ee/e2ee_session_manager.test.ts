@@ -127,3 +127,28 @@ test("e2ee_session_manager retries only recoverable prekey base-key session erro
         false,
     );
 });
+
+test("e2ee_session_manager serializes decrypts for the same remote device", async () => {
+    const manager: any = createSessionManager(async () => ({}));
+    let active = 0;
+    let maxActive = 0;
+    const order: string[] = [];
+    manager.decryptSignalCipherMessageCore = async (_uid: string, _device: string, _type: any, ciphertext: string) => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        order.push(`start:${ciphertext}`);
+        await new Promise(resolve => setTimeout(resolve, 5));
+        order.push(`end:${ciphertext}`);
+        active--;
+        return ciphertext;
+    };
+
+    const values = await Promise.all([
+        manager.decryptSignalCipherMessage("bob", "bob-web", 1, "one"),
+        manager.decryptSignalCipherMessage("bob", "bob-web", 1, "two"),
+    ]);
+
+    assert.equal(maxActive, 1);
+    assert.deepEqual(order, ["start:one", "end:one", "start:two", "end:two"]);
+    assert.deepEqual(values, ["one", "two"]);
+});

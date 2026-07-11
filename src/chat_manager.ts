@@ -7,6 +7,7 @@ import { Task, MessageTask, TaskStatus } from "./task";
 import { Md5 } from "md5-typescript";
 import { SecurityManager } from "./security";
 import { utf8BytesToString } from "./utils/utf8";
+import { E2EECacheStore, E2EE_CACHE_STORES } from "./e2ee/e2ee_cache_store";
 
 export type MessageListener = ((message: Message) => void);
 export type MessageStatusListener = ((p: SendackPacket) => void);
@@ -48,6 +49,8 @@ export class ChatManager {
     sendStatusListeners: MessageStatusListener[] = new Array(); // 消息状态监听
     clientSeq: number = 0
     private e2eePlaintextMemoryCache: Map<string, string> = new Map()
+    private e2eeDecryptInFlight: Map<string, { promise: Promise<void>; message: Message }> = new Map()
+    private e2eePlaintextMigrationScopes: Set<string> = new Set()
     private e2eeDecryptFailureMemoryCache: Map<string, number> = new Map()
     private e2eeDecryptFailureTTL: number = 10 * 60 * 1000
     private realtimeE2EERetryDelays: number[] = [300, 800, 1500, 3000]
@@ -198,7 +201,7 @@ export class ChatManager {
 
         const message = Message.fromSendPacket(packet, localContent)
         if (this.isSignalMessageContent(finalContent)) {
-            this.cacheE2EEPlaintext(message, finalContent, (finalContent as any).e2eePlaintextContent || content)
+            await this.cacheE2EEPlaintext(message, finalContent, (finalContent as any).e2eePlaintextContent || content)
         }
         if (finalContent instanceof MediaMessageContent) {
             if(!finalContent.file) { // 没有文件，直接上传
@@ -250,8 +253,46 @@ export class ChatManager {
         if (!this.isSignalMessageContent(message.content)) {
             return
         }
+        const signalContent = message.content as MessageSignalContent
+        const workKey = this.e2eeDecryptWorkKey(message, signalContent)
+        const existing = workKey ? this.e2eeDecryptInFlight.get(workKey) : undefined
+        if (existing) {
+            await existing.promise
+            const restored = await this.restoreCachedE2EEPlaintext(message, signalContent)
+            if (restored) {
+                message.content = await WKSDK.shared().config.e2ee.restoreCachedPlaintext(restored, message.channel)
+                ;(message as any).e2eePendingDecrypt = false
+                ;(message as any).e2eeDecryptFailed = false
+                return
+            }
+            if (!this.isSignalMessageContent(existing.message.content)) {
+                message.content = existing.message.content
+                ;(message as any).e2eePendingDecrypt = (existing.message as any).e2eePendingDecrypt
+                ;(message as any).e2eeDecryptFailed = (existing.message as any).e2eeDecryptFailed
+                ;(message as any).e2eeDecryptError = (existing.message as any).e2eeDecryptError
+                return
+            }
+        }
+
+        const promise = this.decryptMessageIfNeededInternal(message, options)
+        if (workKey) {
+            this.e2eeDecryptInFlight.set(workKey, { promise, message })
+        }
+        try {
+            await promise
+        } finally {
+            if (workKey && this.e2eeDecryptInFlight.get(workKey)?.promise === promise) {
+                this.e2eeDecryptInFlight.delete(workKey)
+            }
+        }
+    }
+
+    private async decryptMessageIfNeededInternal(message: Message, options: DecryptMessageOptions = {}): Promise<void> {
+        if (!this.isSignalMessageContent(message.content)) {
+            return
+        }
         const signalContent = message.content
-        const cachedContent = this.restoreCachedE2EEPlaintext(message, signalContent)
+        const cachedContent = await this.restoreCachedE2EEPlaintext(message, signalContent)
         if (cachedContent) {
             try {
                 this.logRealtimeE2EEStep("E2EE解密尝试使用本地明文缓存", message, signalContent)
@@ -262,7 +303,7 @@ export class ChatManager {
                 return
             } catch (error) {
                 this.logRealtimeE2EEStep("E2EE本地明文缓存恢复失败，删除缓存后继续密文解密", message, signalContent, { error: this.e2eeErrorText(error) })
-                this.removeE2EEPlaintextCacheKeys(message, signalContent)
+                await this.removeE2EEPlaintextCacheKeys(message, signalContent)
                 this.debugE2EEDecryptFailure(message, cachedContent, error)
                 console.error("[E2EE] cached plaintext restore failed", {
                     channelID: message.channel && message.channel.channelID,
@@ -285,7 +326,7 @@ export class ChatManager {
             this.logRealtimeE2EEStep("E2EE开始调用解密适配器", message, signalContent)
             message.content = await WKSDK.shared().config.e2ee.decryptMessage(message.content, message.channel, decryptContext)
             this.logRealtimeE2EEStep("E2EE解密适配器返回成功", message, signalContent, { costMs: Date.now() - decryptStartedAt, contentType: message.contentType })
-            this.cacheE2EEPlaintext(message, signalContent, message.content)
+            await this.cacheE2EEPlaintext(message, signalContent, message.content)
             this.debugE2EEDecrypt("after", message, message.content)
             ;(message as any).e2eePendingDecrypt = false
             ;(message as any).e2eeDecrypting = false
@@ -322,7 +363,7 @@ export class ChatManager {
                         this.logRealtimeE2EEStep("E2EE密钥恢复成功，开始二次解密", message, signalContent)
                         message.content = await WKSDK.shared().config.e2ee.decryptMessage(signalContent, message.channel, decryptContext)
                         this.logRealtimeE2EEStep("E2EE二次解密成功", message, signalContent, { costMs: Date.now() - retryStartedAt, contentType: message.contentType })
-                        this.cacheE2EEPlaintext(message, signalContent, message.content)
+                        await this.cacheE2EEPlaintext(message, signalContent, message.content)
                         this.debugE2EEDecrypt("after", message, message.content)
                         ;(message as any).e2eeDecryptFailed = false
                         ;(message as any).e2eeDecryptError = undefined
@@ -660,7 +701,7 @@ export class ChatManager {
     ): Promise<void> {
         await this.recoverRealtimeE2EEDecryptFailure(message, signalContent, context, error, { ...options, realtime: true })
         message.content = await WKSDK.shared().config.e2ee.decryptMessage(signalContent, message.channel, context)
-        this.cacheE2EEPlaintext(message, signalContent, message.content)
+        await this.cacheE2EEPlaintext(message, signalContent, message.content)
         this.debugE2EEDecrypt("after", message, message.content)
         ;(message as any).e2eePendingDecrypt = false
         ;(message as any).e2eeDecryptFailed = false
@@ -1058,7 +1099,7 @@ export class ChatManager {
             }
             try {
                 message.content = await WKSDK.shared().config.e2ee.decryptMessage(signalContent, message.channel, context)
-                this.cacheE2EEPlaintext(message, signalContent, message.content)
+                await this.cacheE2EEPlaintext(message, signalContent, message.content)
                 this.debugE2EEDecrypt("after", message, message.content)
                 ;(message as any).e2eePendingDecrypt = false
                 ;(message as any).e2eeDecryptFailed = false
@@ -1207,7 +1248,7 @@ export class ChatManager {
         return content instanceof MessageSignalContent || (content && content.contentType === MessageContentType.signalMessage)
     }
 
-    cacheE2EEPlaintext(message: Message, signalContent: MessageContent | any, plaintextContent: MessageContent) {
+    async cacheE2EEPlaintext(message: Message, signalContent: MessageContent | any, plaintextContent: MessageContent): Promise<void> {
         if (!plaintextContent) {
             return
         }
@@ -1234,9 +1275,8 @@ export class ChatManager {
                 cachedAt: now,
             })
             for (const key of keys) {
-                this.e2eePlaintextMemoryCache.set(key, value)
-                this.getE2EEPlaintextSessionStorage()?.setItem(key, value)
-                this.getE2EEPlaintextLocalStorage()?.setItem(key, value)
+                this.rememberE2EEPlaintext(key, value)
+                await E2EECacheStore.shared().set(E2EE_CACHE_STORES.PLAINTEXT, key, value)
             }
         } catch (error) {
             if (WKSDK.shared().config.debug) {
@@ -1275,9 +1315,9 @@ export class ChatManager {
         return payload
     }
 
-    restoreCachedE2EEPlaintext(message: Message, signalContent: MessageContent | any): MessageContent | undefined {
+    async restoreCachedE2EEPlaintext(message: Message, signalContent: MessageContent | any): Promise<MessageContent | undefined> {
         for (const key of this.e2eePlaintextCacheKeys(message, signalContent)) {
-            const cached = this.e2eePlaintextMemoryCache.get(key) || this.getE2EEPlaintextSessionStorage()?.getItem(key) || this.getE2EEPlaintextLocalStorage()?.getItem(key)
+            const cached = this.e2eePlaintextMemoryCache.get(key) || await E2EECacheStore.shared().get(E2EE_CACHE_STORES.PLAINTEXT, key)
             if (!cached) {
                 continue
             }
@@ -1290,7 +1330,7 @@ export class ChatManager {
                 content.decode(this.stringToUint8Array(JSON.stringify(payload)))
                 return content
             } catch (error) {
-                this.removeE2EEPlaintextCacheKey(key)
+                await this.removeE2EEPlaintextCacheKey(key)
                 if (WKSDK.shared().config.debug) {
                     console.warn("[E2EE] plaintext cache read failed", error)
                 }
@@ -1299,15 +1339,14 @@ export class ChatManager {
         return undefined
     }
 
-    private removeE2EEPlaintextCacheKey(key: string) {
+    private async removeE2EEPlaintextCacheKey(key: string): Promise<void> {
         this.e2eePlaintextMemoryCache.delete(key)
-        this.getE2EEPlaintextSessionStorage()?.removeItem(key)
-        this.getE2EEPlaintextLocalStorage()?.removeItem(key)
+        await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.PLAINTEXT, key)
     }
 
-    private removeE2EEPlaintextCacheKeys(message: Message, signalContent: MessageContent | any) {
+    private async removeE2EEPlaintextCacheKeys(message: Message, signalContent: MessageContent | any): Promise<void> {
         for (const key of this.e2eePlaintextCacheKeys(message, signalContent)) {
-            this.removeE2EEPlaintextCacheKey(key)
+            await this.removeE2EEPlaintextCacheKey(key)
         }
     }
 
@@ -1350,6 +1389,11 @@ export class ChatManager {
         const deviceId = WKSDK.shared().config.e2ee?.currentOptions?.deviceId || ""
         const keys: string[] = []
         const prefix = `wk_e2ee_plaintext:${uid}:${deviceId}:`
+        const scope = `${uid}:${deviceId}`
+        if (uid && deviceId && !this.e2eePlaintextMigrationScopes.has(scope)) {
+            this.e2eePlaintextMigrationScopes.add(scope)
+            E2EECacheStore.shared().scheduleLegacyMigration(E2EE_CACHE_STORES.PLAINTEXT, prefix)
+        }
         if (message.messageID) {
             keys.push(`${prefix}mid:${message.messageID}`)
         }
@@ -1363,25 +1407,23 @@ export class ChatManager {
         return keys
     }
 
-    getE2EEPlaintextSessionStorage(): Storage | undefined {
-        try {
-            if (typeof sessionStorage !== "undefined") {
-                return sessionStorage
-            }
-        } catch (_error) {
-            return undefined
+    private e2eeDecryptWorkKey(message: Message, signalContent: MessageSignalContent): string {
+        const keys = this.e2eePlaintextCacheKeys(message, signalContent)
+        if (keys.length > 0) {
+            return keys[0]
         }
-        return undefined
+        return this.e2eeDecryptFailureCacheKey(message, signalContent)
     }
 
-    getE2EEPlaintextLocalStorage(): Storage | undefined {
-        try {
-            if (typeof localStorage === "undefined") {
-                return undefined
+    private rememberE2EEPlaintext(key: string, value: string): void {
+        this.e2eePlaintextMemoryCache.delete(key)
+        this.e2eePlaintextMemoryCache.set(key, value)
+        while (this.e2eePlaintextMemoryCache.size > 3000) {
+            const oldest = this.e2eePlaintextMemoryCache.keys().next()
+            if (oldest.done) {
+                break
             }
-            return localStorage
-        } catch (_error) {
-            return undefined
+            this.e2eePlaintextMemoryCache.delete(oldest.value)
         }
     }
 

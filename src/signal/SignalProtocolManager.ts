@@ -13,6 +13,7 @@ import { randomBytes, stringToArrayBuffer, arrayBufferToString } from './utils/b
 import { toBase64, fromBase64 } from './utils/base64'
 import { hkdfSha256Bytes, hkdfExpandWord, arrayBufferToWordArray, wordArrayToUint8Array } from './utils/hkdf'
 import { getDeviceIdFromStorage, getOSAndVersion, generateUUID } from './utils/platform'
+import { migrateSenderKeysFromLocalStorage } from './storage/migrateSenderKeys'
 
 const SESSION_COMPATIBILITY_MIGRATION_VERSION = '20260609-session-rebuild-v2'
 
@@ -112,6 +113,7 @@ export class SignalProtocolManager {
   }
 
   async initialize() {
+    await migrateSenderKeysFromLocalStorage(String(this.uid || ''), this.deviceId, true)
     const result = await this.preKeyManager.initialize()
     if (result && (result as any).uploadedKeys) {
       this.handleLocalKeyRegistrationComplete()

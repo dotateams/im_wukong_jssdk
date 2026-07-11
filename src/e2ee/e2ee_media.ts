@@ -8,6 +8,7 @@ import {
 } from "../model"
 import type { E2EEApiClient, E2EEMediaProvider } from "./e2ee_types"
 import CryptoJS from "crypto-js"
+import { E2EECacheStore, E2EE_CACHE_STORES } from "./e2ee_cache_store"
 
 type MediaPart = {
     url: string
@@ -80,6 +81,13 @@ export class E2EEMediaCrypto {
         this.cacheScope = options.cacheScope
         this.chunkThresholdBytes = Math.max(1, Number(options.chunkThresholdBytes || E2EE_MAX_INLINE_DECRYPT_BYTES))
         this.chunkSize = Math.max(1, Number(options.chunkSize || E2EE_DEFAULT_CHUNK_SIZE))
+        const scope = this.cacheScope ? this.cacheScope() : {}
+        if (scope.uid && scope.deviceId !== undefined && scope.deviceId !== null) {
+            E2EECacheStore.shared().scheduleLegacyMigration(
+                E2EE_CACHE_STORES.THUMBNAILS,
+                `wk_e2ee_media_thumb:${scope.uid}:${String(scope.deviceId)}:`,
+            )
+        }
     }
 
     public canEncrypt(content: MessageContent): boolean {
@@ -361,19 +369,19 @@ export class E2EEMediaCrypto {
             try {
                 await writable.abort()
             } catch (_abortError) {
+                // The original download/decrypt error is more useful to the caller.
             }
             throw error
         }
     }
 
-    public clearLocalData(): void {
-        const storage = this.getLocalStorage()
+    public async clearLocalData(): Promise<void> {
         const scope = this.cacheScope ? this.cacheScope() : {}
-        if (!storage || !scope.uid || scope.deviceId === undefined || scope.deviceId === null) {
+        if (!scope.uid || scope.deviceId === undefined || scope.deviceId === null) {
             return
         }
         const prefix = `wk_e2ee_media_thumb:${scope.uid}:${String(scope.deviceId)}:`
-        this.removeStorageKeysByPrefix(storage, prefix)
+        await E2EECacheStore.shared().clearPrefix(E2EE_CACHE_STORES.THUMBNAILS, prefix)
     }
 
     private emitProgress(callback: ((progress: E2EEMediaProgress) => void) | undefined, progress: {
@@ -745,7 +753,7 @@ export class E2EEMediaCrypto {
     }
 
     private async decryptCachedThumbnailPart(content: MessageEncryptedMedia, part: MediaPart): Promise<Blob> {
-        const cached = this.restoreThumbnailCache(content, part)
+        const cached = await this.restoreThumbnailCache(content, part)
         if (cached) {
             return cached
         }
@@ -754,44 +762,55 @@ export class E2EEMediaCrypto {
         return blob
     }
 
-    private restoreThumbnailCache(content: MessageEncryptedMedia, part: MediaPart): Blob | undefined {
-        const storage = this.getLocalStorage()
+    private async restoreThumbnailCache(content: MessageEncryptedMedia, part: MediaPart): Promise<Blob | undefined> {
         const key = this.thumbnailCacheKey(content, part)
-        if (!storage || !key) {
+        if (!key) {
             return undefined
         }
         try {
-            const raw = storage.getItem(key)
+            const raw = await E2EECacheStore.shared().get(E2EE_CACHE_STORES.THUMBNAILS, key)
             if (!raw) {
                 return undefined
             }
-            const data = JSON.parse(raw)
-            if (!data || data.sha256 !== part.sha256 || typeof data.bytes !== "string") {
-                storage.removeItem(key)
+            const data = typeof raw === "string" ? JSON.parse(raw) : raw
+            if (!data || data.sha256 !== part.sha256) {
+                await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.THUMBNAILS, key)
+                return undefined
+            }
+            if (data.blob instanceof Blob) {
+                return data.blob
+            }
+            if (typeof data.bytes !== "string") {
+                await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.THUMBNAILS, key)
                 return undefined
             }
             const bytes = this.base64Decode(data.bytes)
-            return new Blob([bytes], { type: data.mime || part.mime || "application/octet-stream" })
+            const blob = new Blob([bytes], { type: data.mime || part.mime || "application/octet-stream" })
+            await E2EECacheStore.shared().set(E2EE_CACHE_STORES.THUMBNAILS, key, {
+                sha256: data.sha256,
+                mime: blob.type,
+                blob,
+                cachedAt: data.cachedAt || Date.now(),
+            })
+            return blob
         } catch (_error) {
-            storage.removeItem(key)
+            await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.THUMBNAILS, key)
             return undefined
         }
     }
 
     private async saveThumbnailCache(content: MessageEncryptedMedia, part: MediaPart, blob: Blob): Promise<void> {
-        const storage = this.getLocalStorage()
         const key = this.thumbnailCacheKey(content, part)
-        if (!storage || !key) {
+        if (!key) {
             return
         }
         try {
-            const bytes = new Uint8Array(await blob.arrayBuffer())
-            storage.setItem(key, JSON.stringify({
+            await E2EECacheStore.shared().set(E2EE_CACHE_STORES.THUMBNAILS, key, {
                 sha256: part.sha256,
                 mime: blob.type || part.mime || "application/octet-stream",
-                bytes: this.base64Encode(bytes),
+                blob,
                 cachedAt: Date.now(),
-            }))
+            })
         } catch (_error) {
             // Thumbnail cache is best-effort; display must continue from the decrypted blob.
         }
@@ -1220,29 +1239,6 @@ export class E2EEMediaCrypto {
             : (Buffer as any).from(binary, "binary").toString("base64")
     }
 
-    private getLocalStorage(): Storage | undefined {
-        try {
-            if (typeof localStorage !== "undefined") {
-                return localStorage
-            }
-        } catch (_error) {
-            return undefined
-        }
-        return undefined
-    }
-
-    private removeStorageKeysByPrefix(storage: Storage, prefix: string): void {
-        const keys: string[] = []
-        for (let i = 0; i < storage.length; i++) {
-            const key = storage.key(i)
-            if (key && key.indexOf(prefix) === 0) {
-                keys.push(key)
-            }
-        }
-        for (const key of keys) {
-            storage.removeItem(key)
-        }
-    }
 
     private createObjectURL(blob: Blob): string {
         if (typeof URL !== "undefined" && URL.createObjectURL) {

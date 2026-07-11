@@ -1,7 +1,20 @@
 import * as assert from "assert";
 import { SignalProtocolStore } from "../../src/signal/storage/SignalProtocolStore";
+import { parseSenderKeyStorageKey } from "../../src/signal/storage/migrateSenderKeys";
 
 declare const test: (name: string, fn: () => void | Promise<void>) => void;
+
+test("e2ee_signal_store parses legacy sender-key cache scope before migration", () => {
+    assert.deepEqual(
+        parseSenderKeyStorageKey("signal_sender_key_alice_group1_bob_bob_web_1"),
+        {
+            uid: "alice",
+            groupId: "group1",
+            senderUid: "bob",
+            senderDeviceId: "bob_web_1",
+        },
+    );
+});
 
 test("e2ee_signal_store loads signed prekeys with numeric string aliases", async () => {
     const store: any = new SignalProtocolStore("alice", "web-1");
