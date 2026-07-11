@@ -442,6 +442,9 @@ export class ChatManager {
     }
 
     private logRealtimeE2EEStep(step: string, message: Message, signalContent?: MessageSignalContent, extra?: any): void {
+        if (!this.isE2EETraceLogEnabled()) {
+            return
+        }
         try {
             const content = signalContent || (this.isSignalMessageContent(message.content) ? message.content as MessageSignalContent : undefined)
             const payload = {
@@ -1614,6 +1617,9 @@ export class ChatManager {
     }
 
     private warnMessageListenerSlow(reason: string, message: Message, extra: any) {
+        if (!this.isE2EETraceLogEnabled()) {
+            return
+        }
         try {
             console.warn("[消息性能]", {
                 reason,
@@ -1654,11 +1660,12 @@ export class ChatManager {
             if (listener === this.sendStatusListeners[i]) {
                 this.sendStatusListeners.splice(i, 1)
                 return
-            }
         }
     }
 
     // 将发送消息队列里的消息flush出去
+    }
+
     flushSendingQueue() {
         if (this.sendingQueues.size <= 0) {
             return;
@@ -1682,6 +1689,11 @@ export class ChatManager {
 
     deleteMessageFromSendingQueue(clientSeq: number) {
         this.sendingQueues.delete(clientSeq)
+    }
+
+    private isE2EETraceLogEnabled(): boolean {
+        const config = WKSDK.shared().config as any
+        return config && config.debug === true && config.e2eeTrace === true
     }
 
 }

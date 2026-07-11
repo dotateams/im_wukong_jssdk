@@ -1578,6 +1578,37 @@ test("e2ee_chat_manager drains pending sender-key repairs after group send ack",
     }
 });
 
+test("e2ee_chat_manager only prints realtime step logs when explicit trace is enabled", async () => {
+    const sdk = resetSdk();
+    sdk.config.debug = false;
+    (sdk.config as any).e2eeTrace = false;
+    const originalInfo = console.info;
+    const logs: any[] = [];
+    const message = new Message();
+    message.channel = new Channel("group-1", ChannelTypeGroup);
+    message.fromUID = "peer";
+    const content = signalContent("signal_group");
+    content.senderDeviceId = "peer-web";
+
+    try {
+        console.info = (...args: any[]) => {
+            logs.push(args);
+        };
+        (sdk.chatManager as any).logRealtimeE2EEStep("收到实时消息", message, content);
+        sdk.config.debug = true;
+        (sdk.config as any).e2eeTrace = false;
+        (sdk.chatManager as any).logRealtimeE2EEStep("收到实时消息", message, content);
+        (sdk.config as any).e2eeTrace = true;
+        (sdk.chatManager as any).logRealtimeE2EEStep("收到实时消息", message, content);
+    } finally {
+        console.info = originalInfo;
+        sdk.config.debug = false;
+        delete (sdk.config as any).e2eeTrace;
+    }
+
+    assert.equal(logs.length, 1);
+});
+
 test("e2ee_chat_manager restores repeated history ciphertext from plaintext cache", async () => {
     const sessionCache = installStorageMock("sessionStorage");
     const sdk = resetSdk();
