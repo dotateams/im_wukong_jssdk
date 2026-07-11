@@ -1,10 +1,11 @@
 const E2EE_CACHE_DB_NAME = "wk_e2ee_cache"
-const E2EE_CACHE_DB_VERSION = 1
+const E2EE_CACHE_DB_VERSION = 2
 
 export const E2EE_CACHE_STORES = {
     PLAINTEXT: "plaintext",
     THUMBNAILS: "thumbnails",
     CHANNEL_DEVICES: "channelDevices",
+    ENVELOPE_MISSING: "envelopeMissing",
 }
 
 export class E2EECacheStore {
@@ -77,6 +78,46 @@ export class E2EECacheStore {
             }
         }
         setTimeout(() => { runBatch(0).catch(() => undefined) }, 0)
+    }
+
+    public async pruneExpiringEntries(storeName: string, maxEntries: number, batchSize = 250): Promise<boolean> {
+        const db = await this.open()
+        if (!db) {
+            return false
+        }
+        const entries: { key: IDBValidKey; expiresAt: number }[] = []
+        await new Promise<void>((resolve, reject) => {
+            try {
+                const transaction = db.transaction(storeName, "readonly")
+                const request = transaction.objectStore(storeName).openCursor()
+                request.onsuccess = () => {
+                    const cursor = request.result
+                    if (!cursor) {
+                        resolve()
+                        return
+                    }
+                    const parsed = this.parseExpiringValue(cursor.value)
+                    entries.push({ key: cursor.key, expiresAt: Number(parsed?.expiresAt || 0) })
+                    cursor.continue()
+                }
+                request.onerror = () => reject(request.error)
+                transaction.onabort = () => reject(transaction.error)
+            } catch (error) {
+                reject(error)
+            }
+        })
+
+        const now = Date.now()
+        const expired = entries.filter(entry => entry.expiresAt <= now)
+        const active = entries.filter(entry => entry.expiresAt > now).sort((a, b) => a.expiresAt - b.expiresAt)
+        const overflow = active.slice(0, Math.max(0, active.length - Math.max(0, maxEntries)))
+        const deletions = expired.concat(overflow).slice(0, Math.max(1, batchSize))
+        if (deletions.length > 0) {
+            await this.transaction(db, storeName, "readwrite", store => {
+                deletions.forEach(entry => store.delete(entry.key))
+            })
+        }
+        return expired.length + overflow.length > deletions.length
     }
 
     private async migrateLegacyKey(storeName: string, key: string): Promise<any> {
@@ -191,6 +232,17 @@ export class E2EECacheStore {
             return JSON.stringify({ ...value, blob: undefined, bytes: base64 })
         }
         return JSON.stringify(value)
+    }
+
+    private parseExpiringValue(value: any): any {
+        if (typeof value !== "string") {
+            return value
+        }
+        try {
+            return JSON.parse(value)
+        } catch (_error) {
+            return undefined
+        }
     }
 
     private legacyKeys(prefix: string): string[] {

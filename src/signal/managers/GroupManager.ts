@@ -7,6 +7,7 @@ import { SenderKeyDistributionMessage } from '../models/SenderKeyDistributionMes
 import { GroupCipher } from '../ciphers/GroupCipher';
 import { SmartLRUCache } from '../utils/SmartLRUCache';
 import { E2EEConfigManager } from '../E2EEConfig';
+import { E2EECacheStore, E2EE_CACHE_STORES } from '../../e2ee/e2ee_cache_store';
 
 export class GroupManager {
   parent: any;
@@ -35,6 +36,9 @@ export class GroupManager {
   private readonly senderKeyEnvelopeRecoveryBaseDelayMs: number;
   private readonly senderKeyEnvelopeForceLookupCooldownMs: number;
   private readonly senderKeyEnvelopeMissingPersistentTtlMs: number;
+  private readonly senderKeyEnvelopeMissingPersistentMaxEntries: number;
+  private senderKeyEnvelopeMissingNextCleanupAt: number;
+  private senderKeyEnvelopeMissingPersistentClearPromise?: Promise<void>;
   private readonly firstLoginEnvelopeGraceMs: number;
   private firstLoginGraceUntil: number;
   senderKeyEnvelopeConcurrency: number;
@@ -65,6 +69,8 @@ export class GroupManager {
     this.senderKeyEnvelopeRecoveryBaseDelayMs = Math.max(1, Number(config.retryDelayMs || 1000));
     this.senderKeyEnvelopeForceLookupCooldownMs = Math.max(500, Math.min(Number(config.retryDelayMs || 1000), 3000));
     this.senderKeyEnvelopeMissingPersistentTtlMs = 5 * 60 * 1000;
+    this.senderKeyEnvelopeMissingPersistentMaxEntries = 5000;
+    this.senderKeyEnvelopeMissingNextCleanupAt = 0;
     this.firstLoginEnvelopeGraceMs = Math.max(0, Number(config.firstLoginEnvelopeGraceMs || 30000));
     this.senderKeyEnvelopeConcurrency = Math.max(1, Number(config.senderKeyEnvelopeConcurrency || config.groupDistributionConcurrency || 10));
     this.senderKeyEnvelopeUploadBatchSize = Math.max(1, Number((config as any).senderKeyEnvelopeUploadBatchSize || 100));
@@ -96,6 +102,9 @@ export class GroupManager {
       maxSize: 5000,
       ttlMs: 30 * 1000,
     });
+    const persistentMissingPrefix = this.getPersistentSenderKeyEnvelopeMissingPrefix();
+    E2EECacheStore.shared().scheduleLegacyMigration(E2EE_CACHE_STORES.ENVELOPE_MISSING, persistentMissingPrefix);
+    this.schedulePersistentSenderKeyEnvelopeMissingCleanup();
   }
 
   /**
@@ -125,7 +134,8 @@ export class GroupManager {
     this.senderKeyEnvelopeUploadPromises?.clear?.();
     this.senderKeyEnvelopeMissingCache?.clear?.();
     this.senderKeyEnvelopeForceLookupCache?.clear?.();
-    this.clearPersistentSenderKeyEnvelopeMissingCache();
+    this.senderKeyEnvelopeMissingPersistentClearPromise = this.clearPersistentSenderKeyEnvelopeMissingCache()
+      .catch(() => undefined);
     this.senderKeyRepairRequestCache?.clear?.();
     this.senderKeyRepairBatchQueue?.clear?.();
     if (this.senderKeyRepairBatchTimer) {
@@ -1083,7 +1093,7 @@ export class GroupManager {
       this.groupEnvelopeRecoveryPromises = new Map();
     }
     const recoveryKey = `${groupId}:${senderUid}:${senderDeviceId}:${keyId}:${this.uid}:${this.deviceId}`;
-    if (!options.force && (this.getSenderKeyEnvelopeMissingCache().get(recoveryKey) || this.getPersistentSenderKeyEnvelopeMissing(recoveryKey))) {
+    if (!options.force && (this.getSenderKeyEnvelopeMissingCache().get(recoveryKey) || await this.getPersistentSenderKeyEnvelopeMissing(recoveryKey))) {
       return false;
     }
     const forceLookupCache = this.getSenderKeyEnvelopeForceLookupCache();
@@ -1109,18 +1119,18 @@ export class GroupManager {
           if (options.force) {
             forceLookupCache.set(recoveryKey, true);
           } else if (!this.isWithinFirstLoginGrace()) {
-            this.markSenderKeyEnvelopeMissing(recoveryKey);
+            await this.markSenderKeyEnvelopeMissing(recoveryKey);
           }
           await this.requestSenderKeyRepair(repairPayload);
         }
         return recovered;
       })
-      .catch((error) => {
+      .catch(async (error) => {
         if (options.force) {
           forceLookupCache.set(recoveryKey, true);
         }
         if (this.shouldCacheEnvelopeLookupFailure(error, options)) {
-          this.markSenderKeyEnvelopeMissing(recoveryKey);
+          await this.markSenderKeyEnvelopeMissing(recoveryKey);
         }
         const config = E2EEConfigManager.getInstance().getConfig();
         if (config.debugEnabled || config.verboseLogging) {
@@ -1237,9 +1247,9 @@ export class GroupManager {
     return this.senderKeyEnvelopeForceLookupCache;
   }
 
-  private markSenderKeyEnvelopeMissing(recoveryKey: string) {
+  private async markSenderKeyEnvelopeMissing(recoveryKey: string): Promise<void> {
     this.getSenderKeyEnvelopeMissingCache().set(recoveryKey, true);
-    this.setPersistentSenderKeyEnvelopeMissing(recoveryKey);
+    await this.setPersistentSenderKeyEnvelopeMissing(recoveryKey);
   }
 
   private getPersistentSenderKeyEnvelopeMissingKey(recoveryKey: string): string {
@@ -1250,55 +1260,63 @@ export class GroupManager {
     return `e2ee_sender_key_envelope_missing:${this.uid || ''}:${this.deviceId || ''}:`;
   }
 
-  private getPersistentSenderKeyEnvelopeMissing(recoveryKey: string): boolean {
-    if (typeof localStorage === 'undefined') {
-      return false;
-    }
+  private async getPersistentSenderKeyEnvelopeMissing(recoveryKey: string): Promise<boolean> {
     const key = this.getPersistentSenderKeyEnvelopeMissingKey(recoveryKey);
     try {
-      const raw = localStorage.getItem(key);
+      await this.senderKeyEnvelopeMissingPersistentClearPromise;
+      const raw = await E2EECacheStore.shared().get(E2EE_CACHE_STORES.ENVELOPE_MISSING, key);
       if (!raw) {
         return false;
       }
-      const parsed = JSON.parse(raw);
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (!parsed || Number(parsed.expiresAt || 0) <= Date.now()) {
-        localStorage.removeItem(key);
+        await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.ENVELOPE_MISSING, key);
         return false;
       }
       this.getSenderKeyEnvelopeMissingCache().set(recoveryKey, true);
       return true;
     } catch (_) {
-      localStorage.removeItem(key);
+      await E2EECacheStore.shared().delete(E2EE_CACHE_STORES.ENVELOPE_MISSING, key).catch(() => undefined);
       return false;
     }
   }
 
-  private setPersistentSenderKeyEnvelopeMissing(recoveryKey: string) {
-    if (typeof localStorage === 'undefined') {
-      return;
-    }
+  private async setPersistentSenderKeyEnvelopeMissing(recoveryKey: string): Promise<void> {
     try {
-      localStorage.setItem(this.getPersistentSenderKeyEnvelopeMissingKey(recoveryKey), JSON.stringify({
+      await E2EECacheStore.shared().set(E2EE_CACHE_STORES.ENVELOPE_MISSING, this.getPersistentSenderKeyEnvelopeMissingKey(recoveryKey), {
+        createdAt: Date.now(),
         expiresAt: Date.now() + Math.max(1000, Number(this.senderKeyEnvelopeMissingPersistentTtlMs || 5 * 60 * 1000)),
-      }));
+      });
+      this.schedulePersistentSenderKeyEnvelopeMissingCleanup();
     } catch (_) {
       // Ignore storage quota/private-mode failures; the in-memory cache still protects this page lifetime.
     }
   }
 
-  private clearPersistentSenderKeyEnvelopeMissingCache() {
-    if (typeof localStorage === 'undefined') {
+  private async clearPersistentSenderKeyEnvelopeMissingCache(): Promise<void> {
+    await E2EECacheStore.shared().clearPrefix(
+      E2EE_CACHE_STORES.ENVELOPE_MISSING,
+      this.getPersistentSenderKeyEnvelopeMissingPrefix(),
+    );
+  }
+
+  private schedulePersistentSenderKeyEnvelopeMissingCleanup(): void {
+    const now = Date.now();
+    if (now < Number(this.senderKeyEnvelopeMissingNextCleanupAt || 0)) {
       return;
     }
-    const prefix = this.getPersistentSenderKeyEnvelopeMissingPrefix();
-    const keys: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.indexOf(prefix) === 0) {
-        keys.push(key);
+    this.senderKeyEnvelopeMissingNextCleanupAt = now + 60 * 1000;
+    const runBatch = async () => {
+      const hasMore = await E2EECacheStore.shared().pruneExpiringEntries(
+        E2EE_CACHE_STORES.ENVELOPE_MISSING,
+        Number(this.senderKeyEnvelopeMissingPersistentMaxEntries || 5000),
+        250,
+      );
+      if (hasMore) {
+        setTimeout(() => { runBatch().catch(() => undefined); }, 0);
       }
-    }
-    keys.forEach((key) => localStorage.removeItem(key));
+    };
+    setTimeout(() => { runBatch().catch(() => undefined); }, 0);
   }
 
   private async doRecoverSenderKeyFromEnvelope(groupId: any, senderUid: string, senderDeviceId: any, keyId: any): Promise<boolean> {
