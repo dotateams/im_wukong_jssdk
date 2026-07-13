@@ -400,9 +400,19 @@ export class E2EEManager {
         if (!apiClient || typeof apiClient.get !== "function" || typeof apiClient.post !== "function") {
             return options;
         }
-        if (options.senderKeyEnvelopeConcurrency !== undefined) {
+        if (options.senderKeyEnvelopeConcurrency !== undefined ||
+            options.senderKeyEnvelopeUploadBatchSize !== undefined ||
+            options.senderKeyEnvelopeUploadConcurrency !== undefined) {
             E2EEConfigManager.getInstance().updateConfig({
-                senderKeyEnvelopeConcurrency: options.senderKeyEnvelopeConcurrency,
+                ...(options.senderKeyEnvelopeConcurrency !== undefined
+                    ? { senderKeyEnvelopeConcurrency: options.senderKeyEnvelopeConcurrency }
+                    : {}),
+                ...(options.senderKeyEnvelopeUploadBatchSize !== undefined
+                    ? { senderKeyEnvelopeUploadBatchSize: options.senderKeyEnvelopeUploadBatchSize }
+                    : {}),
+                ...(options.senderKeyEnvelopeUploadConcurrency !== undefined
+                    ? { senderKeyEnvelopeUploadConcurrency: options.senderKeyEnvelopeUploadConcurrency }
+                    : {}),
             });
         }
         const signalManager = new SignalProtocolManager(options.uid, apiClient, {

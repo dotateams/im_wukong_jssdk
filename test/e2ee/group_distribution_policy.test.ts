@@ -430,7 +430,7 @@ test("explicit group distribution upload returns compact payload without inline 
   assert.equal(firstEnvelope.is_ecies, true);
 });
 
-test("sender-key envelope upload uses compact batches", async () => {
+test("sender-key envelope upload keeps all recipients in one compact bundle", async () => {
   const uploads: any[] = [];
   const parent = {
     uploadGroupSenderKeyEnvelopes: async (payload: any) => {
@@ -438,7 +438,6 @@ test("sender-key envelope upload uses compact batches", async () => {
     },
   };
   const manager = new GroupManager(parent, "sender", "device") as any;
-  manager.senderKeyEnvelopeUploadBatchSize = 100;
   const ciphertexts = Array.from({ length: 250 }, (_, index) => ({
     uid: `user-${index}`,
     device_id: `device-${index}`,
@@ -452,8 +451,8 @@ test("sender-key envelope upload uses compact batches", async () => {
     distribution: { ciphertexts },
   });
 
-  assert.equal(uploads.length, 3);
-  assert.deepEqual(uploads.map((item) => item.items.length), [100, 100, 50]);
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].items.length, 250);
   assert.ok(uploads.every((item) => item.version === 2));
   assert.ok(uploads.every((item) => item.envelopes === undefined));
 
@@ -463,11 +462,167 @@ test("sender-key envelope upload uses compact batches", async () => {
     sender_uid: "sender",
     sender_device_id: "device",
     key_id: 11,
-    envelopes: ciphertexts.slice(0, 100).map((item) => ({
+    envelopes: ciphertexts.map((item) => ({
       recipient_uid: item.uid,
       recipient_device_id: item.device_id,
       envelope: JSON.stringify({ ...item, is_ecies: true }),
     })),
   }).length;
   assert.ok(compactSize < legacySize * 0.75, `compact=${compactSize} legacy=${legacySize}`);
+});
+
+test("large sender-key envelope upload stages bounded parts before one commit", async () => {
+  const parts: any[] = [];
+  const commits: any[] = [];
+  let legacyUploads = 0;
+  let active = 0;
+  let maxActive = 0;
+  const parent = {
+    generateUUID: () => "1234567890123456",
+    uploadGroupSenderKeyEnvelopes: async () => {
+      legacyUploads += 1;
+    },
+    uploadGroupSenderKeyEnvelopePart: async (payload: any) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      parts.push(payload);
+      active -= 1;
+      return { completed: false };
+    },
+    commitGroupSenderKeyEnvelopeUpload: async (payload: any) => {
+      assert.equal(active, 0);
+      assert.equal(parts.length, 13);
+      commits.push(payload);
+      return { completed: true };
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  manager.senderKeyEnvelopeUploadBatchSize = 100;
+  manager.senderKeyEnvelopeUploadConcurrency = 3;
+  manager.senderKeyEnvelopeUploadMaxAttempts = 1;
+  const ciphertexts = Array.from({ length: 1201 }, (_, index) => ({
+    uid: `user-${index}`,
+    device_id: `device-${index}`,
+    body: `ciphertext-${index}`,
+  }));
+
+  await manager.uploadDistributionEnvelopes("g1", {
+    key_id: 12,
+    distribution: { ciphertexts },
+  });
+
+  assert.equal(legacyUploads, 0);
+  assert.equal(commits.length, 1);
+  assert.equal(maxActive, 3);
+  const ordered = parts.slice().sort((a, b) => a.part_index - b.part_index);
+  assert.deepEqual(ordered.map((item) => item.items.length), [100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 1]);
+  assert.ok(ordered.every((item) => item.version === 3));
+  assert.ok(ordered.every((item) => item.part_count === 13 && item.recipient_count === 1201));
+  assert.equal(commits[0].upload_id, ordered[0].upload_id);
+  assert.equal(commits[0].part_count, 13);
+  assert.equal(commits[0].recipient_count, 1201);
+});
+
+test("multipart sender-key upload falls back once when the first part endpoint is unsupported", async () => {
+  const legacyUploads: any[] = [];
+  let partCalls = 0;
+  let commitCalls = 0;
+  const parent = {
+    uploadGroupSenderKeyEnvelopes: async (payload: any) => legacyUploads.push(payload),
+    uploadGroupSenderKeyEnvelopePart: async () => {
+      partCalls += 1;
+      const error: any = new Error("404 not found");
+      error.status = 404;
+      throw error;
+    },
+    commitGroupSenderKeyEnvelopeUpload: async () => {
+      commitCalls += 1;
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  manager.senderKeyEnvelopeUploadBatchSize = 100;
+  manager.senderKeyEnvelopeUploadMaxAttempts = 1;
+  const ciphertexts = Array.from({ length: 250 }, (_, index) => ({
+    uid: `user-${index}`,
+    device_id: `device-${index}`,
+    body: `ciphertext-${index}`,
+  }));
+
+  await manager.uploadDistributionEnvelopes("g1", {
+    key_id: 13,
+    distribution: { ciphertexts },
+  });
+
+  assert.equal(partCalls, 1);
+  assert.equal(commitCalls, 0);
+  assert.equal(legacyUploads.length, 1);
+  assert.equal(legacyUploads[0].items.length, 250);
+});
+
+test("multipart sender-key upload does not use legacy fallback after staging has started", async () => {
+  let legacyUploads = 0;
+  let commitCalls = 0;
+  const parent = {
+    uploadGroupSenderKeyEnvelopes: async () => {
+      legacyUploads += 1;
+    },
+    uploadGroupSenderKeyEnvelopePart: async (payload: any) => {
+      if (payload.part_index === 1) {
+        const error: any = new Error("temporary 503");
+        error.status = 503;
+        throw error;
+      }
+    },
+    commitGroupSenderKeyEnvelopeUpload: async () => {
+      commitCalls += 1;
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  manager.senderKeyEnvelopeUploadBatchSize = 100;
+  manager.senderKeyEnvelopeUploadConcurrency = 2;
+  manager.senderKeyEnvelopeUploadMaxAttempts = 1;
+  const ciphertexts = Array.from({ length: 201 }, (_, index) => ({
+    uid: `user-${index}`,
+    device_id: `device-${index}`,
+    body: `ciphertext-${index}`,
+  }));
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  try {
+    await assert.rejects(() => manager.uploadDistributionEnvelopes("g1", {
+      key_id: 14,
+      distribution: { ciphertexts },
+    }), /temporary 503/);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(legacyUploads, 0);
+  assert.equal(commitCalls, 0);
+});
+
+test("multipart sender-key upload does not fallback on a textual business error", async () => {
+  const legacyUploads: any[] = [];
+  const parent = {
+    uploadGroupSenderKeyEnvelopes: async (payload: any) => legacyUploads.push(payload),
+    uploadGroupSenderKeyEnvelopePart: async () => {
+      throw new Error("group not found");
+    },
+    commitGroupSenderKeyEnvelopeUpload: async () => {},
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  manager.senderKeyEnvelopeUploadBatchSize = 100;
+  manager.senderKeyEnvelopeUploadMaxAttempts = 1;
+  const ciphertexts = Array.from({ length: 250 }, (_, index) => ({
+    uid: `user-${index}`,
+    device_id: `device-${index}`,
+    body: `ciphertext-${index}`,
+  }));
+
+  await assert.rejects(
+    () => manager.uploadDistributionEnvelopes("group-1", { key_id: 9, distribution: { ciphertexts } }),
+    /group not found/,
+  );
+  assert.equal(legacyUploads.length, 0);
 });

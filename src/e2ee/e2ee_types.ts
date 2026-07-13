@@ -86,6 +86,8 @@ export interface E2EEInitOptions {
     mediaProvider?: E2EEMediaProvider;
     autoCreateSignalAdapter?: boolean;
     senderKeyEnvelopeConcurrency?: number;
+    senderKeyEnvelopeUploadBatchSize?: number;
+    senderKeyEnvelopeUploadConcurrency?: number;
     mediaOptions?: {
         chunkThresholdBytes?: number;
         chunkSize?: number;

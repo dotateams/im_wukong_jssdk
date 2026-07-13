@@ -348,6 +348,37 @@ export class SignalProtocolManager {
     return this.apiClient.post('/e2e/group_sender_keys/envelopes', payload)
   }
 
+  async uploadGroupSenderKeyEnvelopePart(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    const resp = await this.apiClient.post('/e2e/group_sender_keys/envelope_uploads/parts', payload)
+    this.ensureSuccessResponse(resp, 'upload sender-key envelope part')
+    return this.getResponseData(resp)
+  }
+
+  async commitGroupSenderKeyEnvelopeUpload(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    const resp = await this.apiClient.post('/e2e/group_sender_keys/envelope_uploads/commit', payload)
+    this.ensureSuccessResponse(resp, 'commit sender-key envelope upload')
+    return this.getResponseData(resp)
+  }
+
+  private ensureSuccessResponse(resp: any, operation: string) {
+    if (this.isSuccessResponse(resp)) {
+      return
+    }
+    const status = Number(resp?.status ?? resp?.code ?? resp?.error_code ?? 0)
+    const error: any = new Error(`${operation} failed${status ? ` (${status})` : ''}`)
+    if (status) {
+      error.status = status
+    }
+    error.response = resp
+    throw error
+  }
+
   async lookupGroupSenderKeyEnvelope(payload: any) {
     if (!this.apiClient || typeof this.apiClient.post !== 'function') {
       return null

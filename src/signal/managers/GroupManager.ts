@@ -43,6 +43,9 @@ export class GroupManager {
   private firstLoginGraceUntil: number;
   senderKeyEnvelopeConcurrency: number;
   senderKeyEnvelopeUploadBatchSize: number;
+  senderKeyEnvelopeUploadConcurrency: number;
+  senderKeyEnvelopeUploadMaxAttempts: number;
+  senderKeyEnvelopeUploadRetryDelayMs: number;
   private identityRepairGeneration: number;
   private identityRepairDistributionGroups: Set<string>;
 
@@ -73,7 +76,10 @@ export class GroupManager {
     this.senderKeyEnvelopeMissingNextCleanupAt = 0;
     this.firstLoginEnvelopeGraceMs = Math.max(0, Number(config.firstLoginEnvelopeGraceMs || 30000));
     this.senderKeyEnvelopeConcurrency = Math.max(1, Number(config.senderKeyEnvelopeConcurrency || config.groupDistributionConcurrency || 10));
-    this.senderKeyEnvelopeUploadBatchSize = Math.max(1, Number((config as any).senderKeyEnvelopeUploadBatchSize || 100));
+    this.senderKeyEnvelopeUploadBatchSize = Math.max(1, Number(config.senderKeyEnvelopeUploadBatchSize || 100));
+    this.senderKeyEnvelopeUploadConcurrency = Math.max(1, Number(config.senderKeyEnvelopeUploadConcurrency || 3));
+    this.senderKeyEnvelopeUploadMaxAttempts = Math.max(1, Number(config.maxEncryptRetries || 2) + 1);
+    this.senderKeyEnvelopeUploadRetryDelayMs = Math.max(1, Number(config.retryDelayMs || 1000));
     this.senderKeyCache = new SmartLRUCache({
       maxSize: config.maxSenderKeyCacheSize,
       ttlMs: config.sessionCacheTTL,
@@ -535,9 +541,17 @@ export class GroupManager {
       return;
     }
     const doUpload = async () => {
-      for (const batch of this.chunkSenderKeyEnvelopes(envelopes)) {
+      const batchSize = Math.max(1, Number(this.senderKeyEnvelopeUploadBatchSize || 100));
+      const supportsMultipart =
+        typeof this.parent.uploadGroupSenderKeyEnvelopePart === 'function' &&
+        typeof this.parent.commitGroupSenderKeyEnvelopeUpload === 'function';
+      let uploaded = false;
+      if (supportsMultipart && envelopes.length > batchSize) {
+        uploaded = await this.uploadDistributionEnvelopesMultipart(groupId, distribution, envelopes);
+      }
+      if (!uploaded) {
         await this.parent.uploadGroupSenderKeyEnvelopes(
-          this.buildCompactSenderKeyEnvelopeUploadPayload(groupId, distribution, batch),
+          this.buildCompactSenderKeyEnvelopeUploadPayload(groupId, distribution, envelopes),
         );
       }
       if (uploadCacheKey) {
@@ -567,6 +581,124 @@ export class GroupManager {
       batches.push(envelopes.slice(i, i + batchSize));
     }
     return batches;
+  }
+
+  private async uploadDistributionEnvelopesMultipart(groupId: any, distribution: any, envelopes: any[]): Promise<boolean> {
+    const batches = this.chunkSenderKeyEnvelopes(envelopes);
+    if (batches.length <= 1) {
+      return false;
+    }
+    const uploadId = this.createSenderKeyEnvelopeUploadId(distribution);
+    const common = {
+      version: 3,
+      upload_id: uploadId,
+      group_id: groupId,
+      sender_uid: this.uid,
+      sender_device_id: this.deviceId,
+      key_id: distribution.key_id ?? distribution.keyId,
+      part_count: batches.length,
+      recipient_count: envelopes.length,
+    };
+    const firstPayload = this.buildCompactSenderKeyEnvelopePartPayload(common, batches[0], 0);
+    try {
+      await this.uploadSenderKeyEnvelopePartWithRetry(firstPayload, true);
+    } catch (error) {
+      if (this.isMultipartUploadUnsupported(error)) {
+        return false;
+      }
+      throw error;
+    }
+
+    let nextPartIndex = 1;
+    const concurrency = Math.min(
+      Math.max(1, Number(this.senderKeyEnvelopeUploadConcurrency || 3)),
+      Math.max(1, batches.length - 1),
+    );
+    const worker = async () => {
+      while (true) {
+        const partIndex = nextPartIndex++;
+        if (partIndex >= batches.length) {
+          return;
+        }
+        await this.uploadSenderKeyEnvelopePartWithRetry(
+          this.buildCompactSenderKeyEnvelopePartPayload(common, batches[partIndex], partIndex),
+          false,
+        );
+      }
+    };
+    await Promise.all(new Array(concurrency).fill(0).map(() => worker()));
+    await this.commitSenderKeyEnvelopeUploadWithRetry(common);
+    return true;
+  }
+
+  private buildCompactSenderKeyEnvelopePartPayload(common: any, envelopes: any[], partIndex: number) {
+    return {
+      ...common,
+      part_index: partIndex,
+      items: envelopes.map((item) => [
+        item.recipient_uid,
+        item.recipient_device_id,
+        item.envelope,
+      ]),
+    };
+  }
+
+  private async uploadSenderKeyEnvelopePartWithRetry(payload: any, allowUnsupported: boolean): Promise<void> {
+    let lastError: any = null;
+    const attempts = Math.max(1, Number(this.senderKeyEnvelopeUploadMaxAttempts || 1));
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        await this.parent.uploadGroupSenderKeyEnvelopePart(payload);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (allowUnsupported && this.isMultipartUploadUnsupported(error)) {
+          throw error;
+        }
+        if (attempt + 1 >= attempts) {
+          throw error;
+        }
+        await this.delay(this.senderKeyEnvelopeUploadRetryDelayMs * (attempt + 1));
+      }
+    }
+    throw lastError;
+  }
+
+  private async commitSenderKeyEnvelopeUploadWithRetry(payload: any): Promise<void> {
+    let lastError: any = null;
+    const attempts = Math.max(1, Number(this.senderKeyEnvelopeUploadMaxAttempts || 1));
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        await this.parent.commitGroupSenderKeyEnvelopeUpload(payload);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt + 1 >= attempts) {
+          throw error;
+        }
+        await this.delay(this.senderKeyEnvelopeUploadRetryDelayMs * (attempt + 1));
+      }
+    }
+    throw lastError;
+  }
+
+  private isMultipartUploadUnsupported(error: any): boolean {
+    const status = Number(
+      error?.status ?? error?.statusCode ?? error?.response?.status ?? error?.response?.statusCode ?? 0,
+    );
+    if (status === 404 || status === 405 || status === 501) {
+      return true;
+    }
+    return false;
+  }
+
+  private createSenderKeyEnvelopeUploadId(distribution: any): string {
+    const random = this.parent && typeof this.parent.generateUUID === 'function'
+      ? String(this.parent.generateUUID())
+      : `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+    const keyId = String(distribution.key_id ?? distribution.keyId ?? 0);
+    const raw = `${random}_${Date.now().toString(36)}_${keyId}`.replace(/[^A-Za-z0-9_-]/g, '');
+    return raw.padEnd(16, '0').slice(0, 64);
   }
 
   private buildCompactSenderKeyEnvelopeUploadPayload(groupId: any, distribution: any, envelopes: any[]) {
