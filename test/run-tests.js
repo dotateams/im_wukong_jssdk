@@ -63,6 +63,8 @@ async function main() {
   let failed = 0;
   for (const item of selected) {
     try {
+      const { E2EECacheStore, E2EE_CACHE_STORES } = require("../src/e2ee/e2ee_cache_store");
+      await E2EECacheStore.shared().clearPrefix(E2EE_CACHE_STORES.ENVELOPE_MISSING, "");
       if (debug) {
         console.log(`run - ${item.name}`);
       }

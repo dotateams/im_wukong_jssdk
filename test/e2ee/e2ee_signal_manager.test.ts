@@ -107,7 +107,6 @@ test("signal protocol manager encrypts group distribution from provided device b
     manager.hkdfSha256Bytes = () => new Uint8Array(32);
     manager.randomBytes = () => new Uint8Array(12);
     manager.stringToArrayBuffer = (value: string) => new TextEncoder().encode(value).buffer;
-
     const ciphertexts = await manager.encryptGroupDistributionForDevice("bob", "distribution", [{
         uid: "bob",
         device_id: "bob-web",
@@ -117,6 +116,45 @@ test("signal protocol manager encrypts group distribution from provided device b
     assert.equal(ciphertexts.length, 1);
     assert.equal(ciphertexts[0].uid, "bob");
     assert.equal(ciphertexts[0].device_id, "bob-web");
+});
+
+test("signal protocol manager skips one malformed device without blocking valid recipient devices", async () => {
+    const manager: any = new SignalProtocolManager("alice", {
+        get: async (path: string) => {
+            throw new Error(`unexpected key bundle fetch: ${path}`);
+        },
+    }, {
+        deviceId: "alice-web",
+    });
+    manager.ensureWebCrypto = () => undefined;
+    manager.getSubtleCrypto = () => ({
+        importKey: async () => ({}),
+        encrypt: async () => new Uint8Array(20).buffer,
+    });
+    manager.getCurve = async () => ({
+        generateKeyPair: () => ({ pubKey: new Uint8Array([1, 2, 3]), privKey: new Uint8Array([4, 5, 6]) }),
+        calculateAgreement: () => new Uint8Array([7, 8, 9]),
+    });
+    manager.hkdfSha256Bytes = () => new Uint8Array(32);
+    manager.randomBytes = () => new Uint8Array(12);
+    manager.stringToArrayBuffer = (value: string) => new TextEncoder().encode(value).buffer;
+    manager.fromBase64 = (value: string) => {
+        if (value.includes("%")) throw new Error("Invalid base64 ciphertext");
+        return Buffer.from(value, "base64");
+    };
+
+    const ciphertexts = await manager.encryptGroupDistributionForDevice("bob", "distribution", [{
+        uid: "bob",
+        device_id: "bob-invalid",
+        identity_key: "%%%not-base64%%%",
+    }, {
+        uid: "bob",
+        device_id: "bob-valid",
+        identity_key: "AQIDBA==",
+    }]);
+
+    assert.equal(ciphertexts.length, 1);
+    assert.equal(ciphertexts[0].device_id, "bob-valid");
 });
 
 test("signal protocol manager encrypts large group distribution from provided bundles without key fetch fanout", async () => {
@@ -240,7 +278,7 @@ test("group manager uploads sender-key envelopes for early messages without inli
             uploads++;
         },
     };
-    manager.normalizeMemberHash = () => "members-v2";
+    manager.normalizeRotationMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => record;
     manager.saveSenderKeyRecord = async () => undefined;
     manager.buildDistributionPayloadForRecord = async () => ({
@@ -306,7 +344,7 @@ test("group manager periodically uploads sender-key envelopes for unchanged memb
             uploads++;
         },
     };
-    manager.normalizeMemberHash = () => "members-v2";
+    manager.normalizeRotationMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => record;
     manager.saveSenderKeyRecord = async () => undefined;
     manager.buildDistributionPayloadForRecord = async () => ({
@@ -364,7 +402,7 @@ test("group manager uploads sender key envelopes without attaching inline distri
             uploaded = payload;
         },
     };
-    manager.normalizeMemberHash = () => "members-v2";
+    manager.normalizeRotationMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => record;
     manager.saveSenderKeyRecord = async () => undefined;
     manager.buildDistributionPayloadForRecord = async () => ({
@@ -516,7 +554,7 @@ test("group manager prepareGroupSend uploads envelopes without advancing sender 
     let uploaded = 0;
     let saved = 0;
 
-    manager.normalizeMemberHash = () => "members-v2";
+    manager.normalizeRotationMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => null;
     manager.createSenderKeyRecord = async () => record;
     manager.buildDistributionPayloadForRecord = async () => ({
@@ -690,7 +728,7 @@ test("group manager prepareGroupSend uploads sender key only to pending repair d
             ],
         }),
     };
-    manager.normalizeMemberHash = () => "members-v2";
+    manager.normalizeRotationMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => record;
     manager.buildDistributionPayloadForRecord = async (_groupId: string, _record: any, members: any[]) => {
         builtMembers = members;
@@ -778,7 +816,7 @@ test("group manager pending repair lookup uses bounded page and drains has_more 
     await new Promise((resolve) => setTimeout(resolve, 180));
 
     assert.equal(repaired, 1);
-    assert.deepEqual(requestedLimits, [500, 500]);
+    assert.deepEqual(requestedLimits, [200, 200]);
     assert.equal(lookups, 2);
     assert.equal(uploads, 2);
 });
@@ -850,7 +888,7 @@ test("group manager encryptGroupMessage uploads pending repair envelopes before 
             ],
         }),
     };
-    manager.normalizeMemberHash = () => "members-v2";
+    manager.normalizeRotationMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => record;
     manager.saveSenderKeyRecord = async () => undefined;
     manager.shouldReuploadAfterIdentityRepair = () => false;
@@ -917,7 +955,7 @@ test("group manager prepareGroupSend waits for active group encryption lock", as
     }));
 
     let started = false;
-    manager.normalizeMemberHash = () => "members-v2";
+    manager.normalizeRotationMemberHash = () => "members-v2";
     manager.loadSenderKeyRecord = async () => {
         started = true;
         return { memberHash: "members-v2" };
@@ -1024,6 +1062,7 @@ test("group manager reuploads existing sender-key envelopes after local identity
     });
 
     let uploads = 0;
+    manager.normalizeRotationMemberHash = () => "members-v1";
     manager.loadSenderKeyRecord = async () => record;
     manager.saveSenderKeyRecord = async () => undefined;
     manager.buildDistributionPayloadForRecord = async () => ({

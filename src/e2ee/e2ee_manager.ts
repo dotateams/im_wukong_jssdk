@@ -402,6 +402,7 @@ export class E2EEManager {
         }
         if (options.senderKeyEnvelopeConcurrency !== undefined ||
             options.senderKeyEnvelopeUploadBatchSize !== undefined ||
+            options.senderKeyEnvelopeUploadTargetBytes !== undefined ||
             options.senderKeyEnvelopeUploadConcurrency !== undefined) {
             E2EEConfigManager.getInstance().updateConfig({
                 ...(options.senderKeyEnvelopeConcurrency !== undefined
@@ -409,6 +410,9 @@ export class E2EEManager {
                     : {}),
                 ...(options.senderKeyEnvelopeUploadBatchSize !== undefined
                     ? { senderKeyEnvelopeUploadBatchSize: options.senderKeyEnvelopeUploadBatchSize }
+                    : {}),
+                ...(options.senderKeyEnvelopeUploadTargetBytes !== undefined
+                    ? { senderKeyEnvelopeUploadTargetBytes: options.senderKeyEnvelopeUploadTargetBytes }
                     : {}),
                 ...(options.senderKeyEnvelopeUploadConcurrency !== undefined
                     ? { senderKeyEnvelopeUploadConcurrency: options.senderKeyEnvelopeUploadConcurrency }

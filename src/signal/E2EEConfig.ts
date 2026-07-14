@@ -10,6 +10,7 @@ export interface E2EEConfig {
   groupDistributionConcurrency: number;
   senderKeyEnvelopeConcurrency: number;
   senderKeyEnvelopeUploadBatchSize: number;
+	senderKeyEnvelopeUploadTargetBytes: number;
   senderKeyEnvelopeUploadConcurrency: number;
   senderKeyDistributionInterval: number;
   maxBatchSize: number;
@@ -59,8 +60,9 @@ export const DEFAULT_E2EE_CONFIG: E2EEConfig = {
   // 并发控制
   groupDistributionConcurrency: 8,
   senderKeyEnvelopeConcurrency: 10,
-  senderKeyEnvelopeUploadBatchSize: 100,
-  senderKeyEnvelopeUploadConcurrency: 3,
+  senderKeyEnvelopeUploadBatchSize: 500,
+  senderKeyEnvelopeUploadTargetBytes: 1024 * 1024,
+  senderKeyEnvelopeUploadConcurrency: 2,
   senderKeyDistributionInterval: 0,
   maxBatchSize: 16,
   minBatchSize: 4,

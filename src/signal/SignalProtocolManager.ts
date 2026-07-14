@@ -571,38 +571,42 @@ export class SignalProtocolManager {
     }
     const ciphertexts: any[] = []
     for (const bundle of resp) {
-      // const bundleData: any = await this.getRemoteKeyBundle(recipientUid, recipientDeviceId)
-      const identityKeyRaw = bundle.identityKey
-      if (!identityKeyRaw) {
-        console.error("[SignalProtocolManager] Missing identity key in bundle", bundle)
-        throw new Error("Missing identity key")
+      try {
+        const identityKeyRaw = bundle.identityKey
+        if (!identityKeyRaw) {
+          throw new Error("Missing identity key")
+        }
+        const identityPubKey = this.fromBase64(identityKeyRaw)
+        if (identityPubKey.byteLength === 0) {
+          throw new Error("Invalid identity key")
+        }
+        const curve = await this.getCurve()
+        const ephemeral = curve.generateKeyPair()
+        const sharedSecret = curve.calculateAgreement(identityPubKey, ephemeral.privKey)
+        const keyBytes = this.hkdfSha256Bytes(sharedSecret, "wukong_group_distribution_v1", "aes-256-gcm", 32)
+        const key = await subtle.importKey("raw", keyBytes.buffer, { name: "AES-GCM" }, false, ["encrypt"])
+        const ivBytes = this.randomBytes(12)
+        const cipherBuffer = await subtle.encrypt({ name: "AES-GCM", iv: ivBytes }, key, this.stringToArrayBuffer(distributionPlain))
+        const cipherBytes = new Uint8Array(cipherBuffer)
+        const tagBytes = cipherBytes.slice(cipherBytes.length - 16)
+        const bodyBytes = cipherBytes.slice(0, cipherBytes.length - 16)
+        ciphertexts.push({
+          uid: recipientUid,
+          device_id: bundle.deviceId,
+          enc: "aes-256-gcm",
+          kdf: "hkdf-sha256",
+          eph_pub: this.toBase64(ephemeral.pubKey),
+          iv: this.toBase64(ivBytes),
+          body: this.toBase64(bodyBytes),
+          tag: this.toBase64(tagBytes),
+        })
+      } catch (error) {
+        console.warn("[SignalProtocolManager] Skipping invalid recipient device key", {
+          recipientUid,
+          deviceId: bundle && bundle.deviceId,
+          error: error instanceof Error ? error.message : String(error),
+        })
       }
-      const identityPubKey = this.fromBase64(identityKeyRaw)
-      if (identityPubKey.byteLength === 0) {
-        console.error("[SignalProtocolManager] Invalid identity key length (0)", identityKeyRaw)
-        throw new Error("Invalid identity key")
-      }
-      // await this.ensureTrustedIdentityKey(recipientUid, recipientDeviceId, identityPubKey)
-      const curve = await this.getCurve()
-      const ephemeral = curve.generateKeyPair()
-      const sharedSecret = curve.calculateAgreement(identityPubKey, ephemeral.privKey)
-      const keyBytes = this.hkdfSha256Bytes(sharedSecret, "wukong_group_distribution_v1", "aes-256-gcm", 32)
-      const key = await subtle.importKey("raw", keyBytes.buffer, { name: "AES-GCM" }, false, ["encrypt"])
-      const ivBytes = this.randomBytes(12)
-      const cipherBuffer = await subtle.encrypt({ name: "AES-GCM", iv: ivBytes }, key, this.stringToArrayBuffer(distributionPlain))
-      const cipherBytes = new Uint8Array(cipherBuffer)
-      const tagBytes = cipherBytes.slice(cipherBytes.length - 16)
-      const bodyBytes = cipherBytes.slice(0, cipherBytes.length - 16)
-      ciphertexts.push({
-        uid: recipientUid,
-        device_id: bundle.deviceId,
-        enc: "aes-256-gcm",
-        kdf: "hkdf-sha256",
-        eph_pub: this.toBase64(ephemeral.pubKey),
-        iv: this.toBase64(ivBytes),
-        body: this.toBase64(bodyBytes),
-        tag: this.toBase64(tagBytes),
-      })
     }
     return ciphertexts
   }
@@ -720,6 +724,15 @@ export class SignalProtocolManager {
       }
       throw e
     }
+  }
+
+  async lookupGroupSenderKeyStateBatch(payload: any) {
+    if (!this.apiClient || typeof this.apiClient.post !== 'function') {
+      return null
+    }
+    const resp = await this.apiClient.post('/e2e/group_sender_keys/state/batch', payload)
+    this.ensureSuccessResponse(resp, 'lookup sender-key state batch')
+    return this.getResponseData(resp)
   }
 
   async signGroupPayload(signingPrivKeyBase64: string, groupId: any, senderUid: any, msgIndex: any, ivBase64: any, bodyBase64: any, macBase64: any, enc: any, tagBase64: any) {

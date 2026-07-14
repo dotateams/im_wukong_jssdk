@@ -43,11 +43,18 @@ export class GroupManager {
   private firstLoginGraceUntil: number;
   senderKeyEnvelopeConcurrency: number;
   senderKeyEnvelopeUploadBatchSize: number;
+  senderKeyEnvelopeUploadTargetBytes: number;
   senderKeyEnvelopeUploadConcurrency: number;
   senderKeyEnvelopeUploadMaxAttempts: number;
   senderKeyEnvelopeUploadRetryDelayMs: number;
   private identityRepairGeneration: number;
   private identityRepairDistributionGroups: Set<string>;
+  private groupStateLastCheckedAt: Map<string, number>;
+  private groupStateVersions: Map<string, { directoryVersion: number; repairVersion: number; bundleHash: string }>;
+  private groupStateCheckPromises: Map<string, Promise<void>>;
+  private groupStateBatchQueue: Map<string, any>;
+  private groupStateBatchTimer: any;
+  private groupStateUnsupportedUntil: number;
 
   constructor(parent: any, uid: any, deviceId: any) {
     this.parent = parent;
@@ -62,6 +69,12 @@ export class GroupManager {
     this.senderKeyEnvelopeLookupBatchTimer = null;
     this.identityRepairGeneration = 0;
     this.identityRepairDistributionGroups = new Set();
+    this.groupStateLastCheckedAt = new Map();
+    this.groupStateVersions = new Map();
+    this.groupStateCheckPromises = new Map();
+    this.groupStateBatchQueue = new Map();
+    this.groupStateBatchTimer = null;
+    this.groupStateUnsupportedUntil = 0;
     this.firstLoginGraceUntil = 0;
     this.signalStore = new SignalProtocolStoreClass(uid, deviceId);
 
@@ -76,8 +89,9 @@ export class GroupManager {
     this.senderKeyEnvelopeMissingNextCleanupAt = 0;
     this.firstLoginEnvelopeGraceMs = Math.max(0, Number(config.firstLoginEnvelopeGraceMs || 30000));
     this.senderKeyEnvelopeConcurrency = Math.max(1, Number(config.senderKeyEnvelopeConcurrency || config.groupDistributionConcurrency || 10));
-    this.senderKeyEnvelopeUploadBatchSize = Math.max(1, Number(config.senderKeyEnvelopeUploadBatchSize || 100));
-    this.senderKeyEnvelopeUploadConcurrency = Math.max(1, Number(config.senderKeyEnvelopeUploadConcurrency || 3));
+    this.senderKeyEnvelopeUploadBatchSize = Math.min(500, Math.max(1, Number(config.senderKeyEnvelopeUploadBatchSize || 500)));
+    this.senderKeyEnvelopeUploadTargetBytes = Math.min(1024 * 1024, Math.max(64 * 1024, Number(config.senderKeyEnvelopeUploadTargetBytes || 1024 * 1024)));
+    this.senderKeyEnvelopeUploadConcurrency = Math.min(4, Math.max(1, Number(config.senderKeyEnvelopeUploadConcurrency || 2)));
     this.senderKeyEnvelopeUploadMaxAttempts = Math.max(1, Number(config.maxEncryptRetries || 2) + 1);
     this.senderKeyEnvelopeUploadRetryDelayMs = Math.max(1, Number(config.retryDelayMs || 1000));
     this.senderKeyCache = new SmartLRUCache({
@@ -106,7 +120,7 @@ export class GroupManager {
     });
     this.senderKeyRepairRequestCache = new SmartLRUCache({
       maxSize: 5000,
-      ttlMs: 30 * 1000,
+      ttlMs: 10 * 60 * 1000,
     });
     const persistentMissingPrefix = this.getPersistentSenderKeyEnvelopeMissingPrefix();
     E2EECacheStore.shared().scheduleLegacyMigration(E2EE_CACHE_STORES.ENVELOPE_MISSING, persistentMissingPrefix);
@@ -382,6 +396,7 @@ export class GroupManager {
           repairMs,
           totalMs: this.now() - startedAt,
         });
+        this.scheduleGroupStateCheck(groupId, record, normalizedMemberHash);
         return true;
       }
       const createStartedAt = this.now();
@@ -403,6 +418,7 @@ export class GroupManager {
         }
       }
       await this.saveSenderKeyRecord(groupId, this.uid, record, this.deviceId);
+      this.scheduleGroupStateCheck(groupId, record, normalizedMemberHash);
       this.logPerf('prepareGroupSend', {
         groupId,
         memberCount: Array.isArray(members) ? members.length : 0,
@@ -481,6 +497,7 @@ export class GroupManager {
       //   signing_pub_key: payload.signing_pub_key,
       // })
       await this.saveSenderKeyRecord(groupId, this.uid, record, this.deviceId);
+      this.scheduleGroupStateCheck(groupId, record, normalizedMemberHash);
       this.logPerf('encryptGroupMessage', {
         groupId,
         memberCount: Array.isArray(members) ? members.length : 0,
@@ -501,6 +518,123 @@ export class GroupManager {
       currentLock.catch(() => undefined),
     );
     return await currentLock;
+  }
+
+  private scheduleGroupStateCheck(groupId: any, record: any, memberHash: string): void {
+    if (!groupId || !record || !this.parent || typeof this.parent.lookupGroupSenderKeyStateBatch !== 'function') {
+      return;
+    }
+    const now = Date.now();
+    if (now < this.groupStateUnsupportedUntil) {
+      return;
+    }
+    const state: any = typeof record.getState === 'function' ? record.getState() : null;
+    const keyId = Number(state?.keyId || 0);
+    if (!keyId) {
+      return;
+    }
+    const checkKey = `${groupId}:${keyId}`;
+    const lastCheckedAt = this.groupStateLastCheckedAt.get(checkKey) || 0;
+    if (now - lastCheckedAt < 10 * 60 * 1000 || this.groupStateCheckPromises.has(checkKey)) {
+      return;
+    }
+    this.groupStateLastCheckedAt.set(checkKey, now);
+    const pending = new Promise<void>((resolve) => {
+      this.groupStateBatchQueue.set(checkKey, { checkKey, groupId, keyId, record, memberHash, resolve });
+      if (this.groupStateBatchQueue.size >= 200) {
+        this.flushGroupStateBatchQueue();
+      } else if (!this.groupStateBatchTimer) {
+        this.groupStateBatchTimer = setTimeout(() => {
+          this.groupStateBatchTimer = null;
+          this.flushGroupStateBatchQueue();
+        }, 25);
+      }
+    });
+    this.groupStateCheckPromises.set(checkKey, pending);
+    pending.finally(() => this.groupStateCheckPromises.delete(checkKey));
+  }
+
+  private async flushGroupStateBatchQueue(): Promise<void> {
+    if (this.groupStateBatchTimer) {
+      clearTimeout(this.groupStateBatchTimer);
+      this.groupStateBatchTimer = null;
+    }
+    const queued = Array.from(this.groupStateBatchQueue.values());
+    this.groupStateBatchQueue.clear();
+    for (let offset = 0; offset < queued.length; offset += 200) {
+      const entries = queued.slice(offset, offset + 200);
+      try {
+        const response = await this.parent.lookupGroupSenderKeyStateBatch({
+          device_id: this.deviceId,
+          groups: entries.map((entry: any) => {
+            const known = this.groupStateVersions.get(entry.checkKey);
+            return {
+              group_id: entry.groupId,
+              key_id: entry.keyId,
+              known_directory_version: known?.directoryVersion || 0,
+              known_bundle_hash: known?.bundleHash || '',
+              known_repair_version: known?.repairVersion || 0,
+            };
+          }),
+        });
+        const results = Array.isArray(response?.results) ? response.results : Array.isArray(response) ? response : [];
+        const byGroupAndKey = new Map<string, any>();
+        results.forEach((item: any) => {
+          const id = String(item?.group_id ?? item?.groupId ?? '');
+          const keyId = Number(item?.key_id ?? item?.keyId ?? 0);
+          if (id) byGroupAndKey.set(keyId ? `${id}:${keyId}` : id, item);
+        });
+        await Promise.all(entries.map((entry: any) => this.applyGroupStateResult(
+          entry,
+          byGroupAndKey.get(entry.checkKey) || byGroupAndKey.get(String(entry.groupId)),
+        )));
+      } catch (error) {
+        const status = Number((error as any)?.status ?? (error as any)?.response?.status ?? 0);
+        if (status === 404 || status === 405 || status === 501) {
+          this.groupStateUnsupportedUntil = Date.now() + 30 * 60 * 1000;
+        }
+      } finally {
+        entries.forEach((entry: any) => entry.resolve());
+      }
+    }
+  }
+
+  private async applyGroupStateResult(entry: any, item: any): Promise<void> {
+    if (!item || item.authorized === false) {
+      return;
+    }
+    const known = this.groupStateVersions.get(entry.checkKey);
+    const directoryVersion = Number(item.directory_version ?? item.directoryVersion ?? 0);
+    const repairVersion = Number(item.repair_version ?? item.repairVersion ?? 0);
+    const bundleHash = String(item.bundle_hash ?? item.bundleHash ?? '');
+    if (known && (item.directory_changed || directoryVersion !== known.directoryVersion)) {
+      this.invalidatePreparedDistributionForGroup(entry.groupId);
+      if (typeof this.parent.invalidateChannelDevicesCache === 'function') {
+        this.parent.invalidateChannelDevicesCache(entry.groupId, 2);
+      }
+    }
+    if (known && item.bundle_exists === false) {
+      this.invalidatePreparedDistributionForGroup(entry.groupId);
+    }
+    if (item.has_pending) {
+      this.invalidateGroupRepairRequestCache(entry.groupId);
+      await this.uploadPendingRepairEnvelopes(entry.groupId, entry.record, entry.memberHash || entry.record.memberHash || '', { background: true });
+    }
+    this.groupStateVersions.set(entry.checkKey, { directoryVersion, repairVersion, bundleHash });
+  }
+
+  private invalidatePreparedDistributionForGroup(groupId: any): void {
+    const prefix = `${groupId}:${this.uid}:${this.deviceId}:`;
+    for (const key of this.getSenderKeyDistributionPreparedCache().keys()) {
+      if (typeof key === 'string' && key.indexOf(prefix) === 0) {
+        this.getSenderKeyDistributionPreparedCache().delete(key);
+      }
+    }
+    for (const key of this.getSenderKeyEnvelopeUploadCache().keys()) {
+      if (typeof key === 'string' && key.indexOf(prefix) === 0) {
+        this.getSenderKeyEnvelopeUploadCache().delete(key);
+      }
+    }
   }
 
   async uploadDistributionEnvelopes(groupId: any, distribution: any): Promise<void> {
@@ -541,12 +675,12 @@ export class GroupManager {
       return;
     }
     const doUpload = async () => {
-      const batchSize = Math.max(1, Number(this.senderKeyEnvelopeUploadBatchSize || 100));
+      const batches = this.chunkSenderKeyEnvelopes(envelopes);
       const supportsMultipart =
         typeof this.parent.uploadGroupSenderKeyEnvelopePart === 'function' &&
         typeof this.parent.commitGroupSenderKeyEnvelopeUpload === 'function';
       let uploaded = false;
-      if (supportsMultipart && envelopes.length > batchSize) {
+      if (supportsMultipart && batches.length > 1) {
         uploaded = await this.uploadDistributionEnvelopesMultipart(groupId, distribution, envelopes);
       }
       if (!uploaded) {
@@ -575,12 +709,34 @@ export class GroupManager {
   }
 
   private chunkSenderKeyEnvelopes(envelopes: any[]): any[][] {
-    const batchSize = Math.max(1, Number((this as any).senderKeyEnvelopeUploadBatchSize || 100));
+    const batchSize = Math.min(500, Math.max(1, Number((this as any).senderKeyEnvelopeUploadBatchSize || 500)));
+    const targetBytes = Math.min(1024 * 1024, Math.max(64 * 1024, Number((this as any).senderKeyEnvelopeUploadTargetBytes || 1024 * 1024)));
     const batches: any[][] = [];
-    for (let i = 0; i < envelopes.length; i += batchSize) {
-      batches.push(envelopes.slice(i, i + batchSize));
+    let current: any[] = [];
+    let currentBytes = 2;
+    for (const envelope of envelopes) {
+      const compact = [envelope.recipient_uid, envelope.recipient_device_id, envelope.envelope];
+      const itemBytes = this.estimateUTF8Bytes(JSON.stringify(compact)) + (current.length > 0 ? 1 : 0);
+      if (current.length > 0 && (current.length >= batchSize || currentBytes + itemBytes > targetBytes)) {
+        batches.push(current);
+        current = [];
+        currentBytes = 2;
+      }
+      current.push(envelope);
+      currentBytes += itemBytes;
+    }
+    if (current.length > 0) {
+      batches.push(current);
     }
     return batches;
+  }
+
+  private estimateUTF8Bytes(value: string): number {
+    try {
+      return unescape(encodeURIComponent(value)).length;
+    } catch (_) {
+      return value.length * 3;
+    }
   }
 
   private async uploadDistributionEnvelopesMultipart(groupId: any, distribution: any, envelopes: any[]): Promise<boolean> {
@@ -611,7 +767,7 @@ export class GroupManager {
 
     let nextPartIndex = 1;
     const concurrency = Math.min(
-      Math.max(1, Number(this.senderKeyEnvelopeUploadConcurrency || 3)),
+      Math.min(4, Math.max(1, Number(this.senderKeyEnvelopeUploadConcurrency || 2))),
       Math.max(1, batches.length - 1),
     );
     const worker = async () => {
@@ -736,7 +892,7 @@ export class GroupManager {
         sender_uid: this.uid,
         sender_device_id: this.deviceId,
         key_id: state.keyId,
-        limit: 500,
+        limit: 200,
       });
     } catch (error) {
       const config = E2EEConfigManager.getInstance().getConfig();
@@ -840,7 +996,7 @@ export class GroupManager {
     if (!this.senderKeyRepairRequestCache) {
       this.senderKeyRepairRequestCache = new SmartLRUCache({
         maxSize: 5000,
-        ttlMs: 30 * 1000,
+        ttlMs: 10 * 60 * 1000,
       });
     }
     return this.senderKeyRepairRequestCache;

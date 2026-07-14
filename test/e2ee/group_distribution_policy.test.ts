@@ -524,6 +524,146 @@ test("large sender-key envelope upload stages bounded parts before one commit", 
   assert.equal(commits[0].recipient_count, 1201);
 });
 
+test("sender-key envelope multipart also splits on serialized byte budget", async () => {
+  const parts: any[] = [];
+  const commits: any[] = [];
+  const parent = {
+    generateUUID: () => "bytebudgetupload1",
+    uploadGroupSenderKeyEnvelopes: async () => assert.fail("large byte payload must use multipart"),
+    uploadGroupSenderKeyEnvelopePart: async (payload: any) => parts.push(payload),
+    commitGroupSenderKeyEnvelopeUpload: async (payload: any) => commits.push(payload),
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  manager.senderKeyEnvelopeUploadBatchSize = 500;
+  manager.senderKeyEnvelopeUploadTargetBytes = 1024 * 1024;
+  manager.senderKeyEnvelopeUploadConcurrency = 2;
+  manager.senderKeyEnvelopeUploadMaxAttempts = 1;
+  const ciphertexts = Array.from({ length: 3 }, (_, index) => ({
+    uid: `large-user-${index}`,
+    device_id: `large-device-${index}`,
+    body: "x".repeat(600 * 1024),
+  }));
+
+  await manager.uploadDistributionEnvelopes("g-bytes", { key_id: 88, distribution: { ciphertexts } });
+
+  assert.equal(parts.length, 3);
+  assert.ok(parts.every((part) => part.items.length === 1));
+  assert.equal(commits.length, 1);
+  assert.equal(commits[0].part_count, 3);
+});
+
+test("group sender-key state fallback is low frequency and never blocks send preparation", async () => {
+  let stateCalls = 0;
+  const parent = {
+    lookupGroupSenderKeyStateBatch: async () => {
+      stateCalls += 1;
+      return { results: [{ group_id: "g-state", authorized: true, directory_version: 9, repair_version: 2, bundle_exists: true }] };
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  const record = { memberHash: "members", getState: () => ({ keyId: 19 }) };
+
+  for (let index = 0; index < 1000; index++) {
+    manager.scheduleGroupStateCheck("g-state", record, "members");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(stateCalls, 1);
+  assert.equal(manager.groupStateVersions.get("g-state:19").directoryVersion, 9);
+});
+
+test("group sender-key state change invalidates prepared distribution exactly once", async () => {
+  let stateCalls = 0;
+  let directoryInvalidations = 0;
+  const parent = {
+    lookupGroupSenderKeyStateBatch: async () => {
+      stateCalls += 1;
+      return {
+        results: [{
+          group_id: "g-state-change",
+          authorized: true,
+          directory_version: stateCalls === 1 ? 9 : 10,
+          directory_changed: stateCalls > 1,
+          repair_version: 2,
+          bundle_exists: true,
+        }],
+      };
+    },
+    invalidateChannelDevicesCache: () => {
+      directoryInvalidations += 1;
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  const record = { memberHash: "members", getState: () => ({ keyId: 19 }) };
+  manager.getSenderKeyDistributionPreparedCache().set("g-state-change:sender:device:19:members", true);
+
+  manager.scheduleGroupStateCheck("g-state-change", record, "members");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(manager.getSenderKeyDistributionPreparedCache().size, 1, "first state response only establishes baseline");
+
+  manager.groupStateLastCheckedAt.delete("g-state-change:19");
+  manager.scheduleGroupStateCheck("g-state-change", record, "members");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(stateCalls, 2);
+  assert.equal(directoryInvalidations, 1);
+  assert.equal(manager.getSenderKeyDistributionPreparedCache().size, 0);
+});
+
+test("five hundred group state probes are merged into three bounded requests", async () => {
+  const payloads: any[] = [];
+  const parent = {
+    lookupGroupSenderKeyStateBatch: async (payload: any) => {
+      payloads.push(payload);
+      return {
+        results: payload.groups.map((group: any) => ({
+          group_id: group.group_id,
+          authorized: true,
+          directory_version: 1,
+          repair_version: 0,
+          bundle_exists: true,
+        })),
+      };
+    },
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+  const record = { memberHash: "members", getState: () => ({ keyId: 19 }) };
+
+  for (let index = 0; index < 500; index++) {
+    manager.scheduleGroupStateCheck(`group-${index}`, record, "members");
+  }
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.deepEqual(payloads.map((payload) => payload.groups.length), [200, 200, 100]);
+  assert.equal(manager.groupStateVersions.size, 500);
+});
+
+test("group state responses are matched by group and sender-key id", async () => {
+  const parent = {
+    lookupGroupSenderKeyStateBatch: async (payload: any) => ({
+      results: payload.groups.map((group: any) => ({
+        group_id: group.group_id,
+        key_id: group.key_id,
+        authorized: true,
+        directory_version: group.key_id,
+        repair_version: 0,
+        bundle_hash: `bundle-${group.key_id}`,
+        bundle_exists: true,
+      })),
+    }),
+  };
+  const manager = new GroupManager(parent, "sender", "device") as any;
+
+  manager.scheduleGroupStateCheck("same-group", { memberHash: "members", getState: () => ({ keyId: 19 }) }, "members");
+  manager.scheduleGroupStateCheck("same-group", { memberHash: "members", getState: () => ({ keyId: 20 }) }, "members");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(manager.groupStateVersions.get("same-group:19").directoryVersion, 19);
+  assert.equal(manager.groupStateVersions.get("same-group:19").bundleHash, "bundle-19");
+  assert.equal(manager.groupStateVersions.get("same-group:20").directoryVersion, 20);
+  assert.equal(manager.groupStateVersions.get("same-group:20").bundleHash, "bundle-20");
+});
+
 test("multipart sender-key upload falls back once when the first part endpoint is unsupported", async () => {
   const legacyUploads: any[] = [];
   let partCalls = 0;
